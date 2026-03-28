@@ -64,13 +64,25 @@ DOMAIN_CONFIG = {
         "text_default": "Comments",
         "slug":         "hilton",
     },
+    "netflix": {
+        "label":        "Netflix — Streaming & Entertainment",
+        "id_default":   "Conversation Id",
+        "text_default": "transcripts",
+        "slug":         "netflix",
+    },
+    "spotify": {
+        "label":        "Spotify — Music Streaming",
+        "id_default":   "Conversation Id",
+        "text_default": "Message Text (Translate/Original)",
+        "slug":         "spotify",
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SentimentHub — PPT",
+    page_title="SentimentHub — Multi-Domain",
     layout="wide",
     page_icon="💬",
     initial_sidebar_state="expanded",
@@ -1136,11 +1148,459 @@ def run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb=None)
     return df
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════  NETFLIX (STREAMING) DOMAIN LOGIC  ════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+
+NETFLIX_CONTENT_SET = {
+    "stranger things", "the crown", "bridgerton", "squid game", "money heist",
+    "ozark", "the witcher", "narcos", "breaking bad", "better call saul",
+    "black mirror", "the umbrella academy", "cobra kai", "prison break",
+    "you", "wednesday", "outer banks", "lucifer", "peaky blinders", "dark",
+    "mindhunter", "the sinner", "how to get away with murder", "criminal minds",
+    "the blacklist", "dexter", "bloodline", "kissing booth",
+    "bon appetite", "bon appetit",
+}
+
+NETFLIX_REMOVE_PATTERNS = [
+    r"chat with an agent", r"chat with agent", r"speak to agent",
+    r"talk to agent", r"connect me to agent", r"agent chat",
+    r"chat to agent", r"agent help", r"help chat",
+]
+_NETFLIX_REMOVE_RE = re.compile("|".join(NETFLIX_REMOVE_PATTERNS), re.IGNORECASE)
+
+NETFLIX_NEGATIVE_KEYWORDS = {
+    "payment_issues": [
+        "money is debited", "money was debited", "money was withdrawn",
+        "charged double", "being charged double", "double charged",
+        "unauthorized charge", "charged without permission",
+        "payment not going through", "unable to do payment",
+        "payment is pending", "payment failed", "payment issue",
+        "billing issue", "billing problem", "wrong amount charged",
+        "overcharged", "charged incorrectly",
+    ],
+    "access_issues": [
+        "cannot access", "cant access", "can't access", "unable to access",
+        "not working properly", "doesn't work", "does not work",
+        "not working", "stopped working", "no longer works",
+        "hacked my account", "account hacked", "compromised account",
+        "locked out", "account locked", "suspended account",
+        "login issue", "login problem", "can't login", "cannot login",
+    ],
+    "delivery_issues": [
+        "still have not received", "have not received", "not received",
+        "did not receive", "never received", "haven't received",
+        "waiting for", "still waiting", "no response",
+        "not delivered", "delivery failed",
+    ],
+    "unwanted_actions": [
+        "without my permission", "without permission", "without consent",
+        "i do not want this membership", "did not want to renew",
+        "did not want to restart", "didn't want to renew",
+        "auto renewed", "automatically renewed", "renewed without asking",
+        "charged after cancellation", "cancelled but charged",
+    ],
+    "technical_issues": [
+        "notifications are getting stuck", "getting stuck", "stuck",
+        "error message", "error occurred", "system error",
+        "technical issue", "technical problem", "glitch",
+        "buffering issue", "streaming problem", "won't load",
+        "keeps crashing", "app crashes", "freezing",
+    ],
+    "frustration": [
+        "frustrating", "frustrated", "annoyed", "angry",
+        "disappointed", "upset", "irritated", "furious",
+        "unacceptable", "ridiculous", "terrible", "horrible",
+        "worst", "pathetic", "useless", "awful",
+        "disgusted", "fed up", "sick of",
+    ],
+    "poor_service": [
+        "thanks for nothing", "no help", "not helpful", "unhelpful",
+        "you dont want to help", "you don't want to help",
+        "waste of time", "wasting my time", "poor service",
+        "bad service", "terrible service", "worst service",
+        "no support", "poor support", "terrible support",
+    ],
+    "resolution_issues": [
+        "not resolved", "still not resolved", "unresolved",
+        "no solution", "not fixed", "still broken",
+        "problem persists", "issue continues", "still having issues",
+        "unforeseen circumstances", "unexpected problem",
+    ],
+    "general_negative": [
+        "problem", "issue", "concern", "complaint",
+        "trouble", "difficulty", "struggle",
+        "wrong", "incorrect", "mistake", "error",
+        "broken", "damaged", "defective",
+        "lost", "missing", "disappeared",
+    ],
+}
+
+_NETFLIX_ALL_NEG_SORTED = sorted(
+    [kw for kws in NETFLIX_NEGATIVE_KEYWORDS.values() for kw in kws],
+    key=len, reverse=True,
+)
+_netflix_neg_kw_re = re.compile(
+    "|".join(re.escape(k) for k in _NETFLIX_ALL_NEG_SORTED), re.IGNORECASE
+)
+
+NETFLIX_NEGATIVE_TRIGGERS = [
+    "still have not received", "have not received", "not received",
+    "money is debited", "money was debited", "money was withdrawn",
+    "without my permission", "without permission",
+    "i do not want this membership", "did not want to renew",
+    "did not want to restart",
+    "thanks for nothing", "notifications are getting stuck", "getting stuck",
+    "unable to do payment", "payment is pending",
+    "frustrating", "frustrated", "annoyed", "angry",
+    "not working properly", "doesn't work", "cant access", "cannot access",
+    "hacked my account", "compromised account",
+    "charged double", "being charged double",
+    "unforeseen circumstances",
+    "you dont want to help", "you don't want to help",
+]
+
+NETFLIX_NEUTRAL_TRIGGERS = [
+    "want my refund back", "please refund", "need a refund",
+    "issue a refund", "can you refund",
+    "change email", "change my email", "update email", "switch to a different email",
+    "change the email address", "need to change my email",
+    "change my card", "change card details", "update payment",
+    "remove payment method", "verify my account with a credit card",
+    "change from premium to standard", "change plan", "switch plan",
+    "automatically changed", "change from standard to premium",
+    "how to", "how can i", "can i get", "is there any discount",
+    "questions about", "just wondering", "need to add",
+    "how to change", "help finding", "unable to access",
+    "device is not part", "can not access from",
+    "just canceled", "want to cancel", "can you cancel",
+    "verify my account", "finding current password",
+]
+
+NETFLIX_POSITIVE_TRIGGERS = [
+    "thank you", "thanks", "appreciate", "grateful",
+    "perfect", "helpful", "great", "excellent", "awesome",
+    "super helpful", "very helpful", "wonderful",
+    "thanks for the quick reply", "appreciate you looking into",
+    "thanks for clarifying", "thanks for explaining",
+]
+
+NETFLIX_VERY_POSITIVE_TRIGGERS = [
+    "bon appetite", "bon appetit",
+    "amazing", "outstanding", "exceeded expectations",
+    "extremely helpful", "incredibly helpful", "absolutely perfect",
+]
+
+_netflix_neg_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_NEGATIVE_TRIGGERS), re.IGNORECASE)
+_netflix_neu_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_NEUTRAL_TRIGGERS), re.IGNORECASE)
+_netflix_pos_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_POSITIVE_TRIGGERS), re.IGNORECASE)
+_netflix_vpos_trig   = re.compile("|".join(re.escape(p) for p in NETFLIX_VERY_POSITIVE_TRIGGERS), re.IGNORECASE)
+
+_NETFLIX_STRONG_NEG_PHRASES = [
+    "without my permission", "do not want this membership",
+    "did not want to renew", "thanks for nothing",
+    "unable to do payment", "still have not received",
+]
+
+
+def _netflix_extract_customer(text):
+    """Extract CUSTOMER messages from Netflix transcript format: [HH:MM:SS CUSTOMER]: ..."""
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    segs = re.findall(
+        r"\[\d{2}:\d{2}:\d{2}\s*CUSTOMER\]:\s*(.*?)(?=\[\d{2}:\d{2}:\d{2}\s*\w+\]:|$)",
+        text, flags=re.DOTALL | re.IGNORECASE,
+    )
+    return " ".join(re.sub(r"\s+", " ", s).strip() for s in segs if s.strip())
+
+
+def _netflix_clean(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    text = _NETFLIX_REMOVE_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 5 or len(text.split()) < 2:
+        return ""
+    return text
+
+
+def _netflix_remove_content_names(text):
+    if not isinstance(text, str) or not text.strip():
+        return text
+    t_lower = text.lower()
+    cleaned = text
+    for content in NETFLIX_CONTENT_SET:
+        if content in t_lower:
+            cleaned = re.compile(re.escape(content), re.IGNORECASE).sub("", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _netflix_classify_by_rules(text):
+    if not isinstance(text, str) or not text.strip():
+        return 0.0, 0.0
+    tl = text.lower()
+    if _netflix_vpos_trig.search(text) or _netflix_pos_trig.search(text):
+        pc = len(re.findall(r"\b(thank|thanks|appreciate|perfect|helpful)\b", tl))
+        if pc >= 2 or _netflix_vpos_trig.search(text):
+            return 0.85, 0.9
+        return 0.40, 0.8
+    if _netflix_neg_trig.search(text):
+        if has_resolution_or_thanks(text):
+            if len(_netflix_neg_trig.findall(text)) == 1 and any(w in tl[-50:] for w in ["thank", "thanks"]):
+                return 0.0, 0.75
+        if any(p in tl for p in _NETFLIX_STRONG_NEG_PHRASES):
+            return -0.65, 0.95
+        return -0.60, 0.80
+    if _netflix_neu_trig.search(text):
+        if is_polite_request(text):
+            return 0.0, 0.90
+        if "refund" in tl and any(p in tl for p in ["please", "want", "can you", "need"]):
+            return 0.0, 0.85
+        return 0.0, 0.80
+    return None, 0.0
+
+
+def _extract_netflix_neg_kw(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    matches = _netflix_neg_kw_re.findall(text)
+    if not matches:
+        return ""
+    seen, found = set(), []
+    for m in matches:
+        ml = m.lower()
+        if ml not in seen:
+            seen.add(ml)
+            found.append(m)
+    return "; ".join(found)
+
+
+def run_netflix_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
+    """Netflix pipeline: extract customer → clean → remove content names → rule+VADER scoring."""
+    analyzer = load_vader()
+    df = df.copy()
+    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
+    df["CustomerOnly"] = df[text_col].apply(_netflix_extract_customer)
+    df["CustomerOnly_Cleaned"] = df["CustomerOnly"].apply(_netflix_clean)
+    df["CustomerOnly_Cleaned"] = df["CustomerOnly_Cleaned"].apply(_netflix_remove_content_names)
+    df["Text_For_Analysis"] = df["CustomerOnly_Cleaned"]
+
+    n = len(df)
+    compounds, confidences, sentiments, sources = [], [], [], []
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
+        norm_id = row["_id_norm"]
+        text = row["Text_For_Analysis"]
+
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            compounds.append(score); confidences.append(1.0)
+            sentiments.append(label); sources.append("Validation")
+            continue
+
+        sources.append("Model")
+        if not isinstance(text, str) or not text.strip():
+            compounds.append(0.0); confidences.append(0.0)
+            sentiments.append("Neutral"); continue
+
+        rule_score, conf = _netflix_classify_by_rules(text)
+        if rule_score is not None and conf > 0.7:
+            compounds.append(round(rule_score, 3))
+            confidences.append(conf)
+            sentiments.append(classify_sentiment(rule_score))
+        else:
+            vader_score = get_vader_compound(text, analyzer)
+            if abs(vader_score) < 0.05:
+                vader_score = 0.0
+            if rule_score is not None:
+                final = (rule_score * conf) + (vader_score * (1 - conf))
+            else:
+                final = vader_score
+            compounds.append(round(final, 3))
+            confidences.append(0.5)
+            sentiments.append(classify_sentiment(final))
+
+    if progress_cb:
+        progress_cb(n, n)
+
+    df["consumer_score"]     = compounds
+    df["confidence"]         = confidences
+    df["consumer_sentiment"] = sentiments
+    df["validation_source"]  = sources
+    df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_netflix_neg_kw)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ══════════════════  SPOTIFY (MUSIC STREAMING) DOMAIN LOGIC  ══════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+
+SPOTIFY_NEGATIVE_TRIGGERS = [
+    "not happy", "difficult", "still can't", "can't make payment",
+    "cannot make payment", "how much longer", "unwilling", "problem",
+    "issue", "refund not", "angry", "complaint",
+    "bad", "poor", "horrible", "terrible", "customer service", "no help",
+    "not satisfied", "disappointed", "policies aren't", "not resolved",
+    "not working", "doesn't work", "worse", "delay", "waiting too long",
+    "frustrated", "cancel", "unacceptable",
+]
+
+SPOTIFY_NEUTRAL_TRIGGERS = [
+    "want to talk", "continue conversation", "verify my", "reach out",
+    "need my spotify", "staff was friendly", "my account is reverted",
+    "I love Spotify", "label user", "no decline", "no billing",
+    "ad is coming", "i want a refund", "refund", "switch", "changed",
+    "changed my card", "i want to reach", "check my account",
+    "contact support", "login", "sign in", "update account",
+    "different subscription",
+]
+
+SPOTIFY_NEGATIVE_KEYWORDS = {
+    "payment_issues": [
+        "can't make payment", "cannot make payment", "refund not",
+        "billing", "overcharged", "charged incorrectly",
+    ],
+    "access_issues": [
+        "not working", "doesn't work", "login", "sign in",
+        "locked out", "account locked",
+    ],
+    "frustration": [
+        "not happy", "angry", "frustrated", "disappointed",
+        "not satisfied", "terrible", "horrible", "unacceptable",
+        "bad", "poor", "worse",
+    ],
+    "service_issues": [
+        "customer service", "no help", "not resolved",
+        "complaint", "delay", "waiting too long",
+        "difficult", "unwilling", "policies aren't",
+    ],
+    "general_negative": [
+        "problem", "issue", "cancel", "still can't",
+        "how much longer",
+    ],
+}
+
+_spotify_neg_trig = re.compile("|".join(re.escape(p) for p in SPOTIFY_NEGATIVE_TRIGGERS), re.IGNORECASE)
+_spotify_neu_trig = re.compile("|".join(re.escape(p) for p in SPOTIFY_NEUTRAL_TRIGGERS), re.IGNORECASE)
+
+_SPOTIFY_ALL_NEG_SORTED = sorted(
+    [kw for kws in SPOTIFY_NEGATIVE_KEYWORDS.values() for kw in kws],
+    key=len, reverse=True,
+)
+_spotify_neg_kw_re = re.compile(
+    "|".join(re.escape(k) for k in _SPOTIFY_ALL_NEG_SORTED), re.IGNORECASE
+)
+
+
+def _spotify_extract_consumer(text):
+    """Extract Consumer messages from Spotify pipe-delimited transcript format."""
+    if isinstance(text, str):
+        parts = text.split("|")
+        msgs = [p.split("Consumer:")[1].strip() for p in parts if "Consumer:" in p]
+        return " ".join(msgs).strip()
+    return ""
+
+
+def _spotify_adjust_score(text, score):
+    """Apply negative or neutral trigger overrides."""
+    if isinstance(text, str):
+        if _spotify_neg_trig.search(text):
+            return -0.6
+        if _spotify_neu_trig.search(text):
+            return 0.0
+    return score
+
+
+def _spotify_detect_language(text):
+    """Detect English vs non-English. Returns 'en' or 'non-en'."""
+    if not isinstance(text, str) or not text.strip():
+        return "non-en"
+    if not _LANGDETECT_OK:
+        return "en"
+    try:
+        from langdetect import detect as _detect
+        return "en" if _detect(text) == "en" else "non-en"
+    except Exception:
+        return "non-en"
+
+
+def _extract_spotify_neg_kw(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    matches = _spotify_neg_kw_re.findall(text)
+    if not matches:
+        return ""
+    seen, found = set(), []
+    for m in matches:
+        ml = m.lower()
+        if ml not in seen:
+            seen.add(ml)
+            found.append(m)
+    return "; ".join(found)
+
+
+def run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
+    """Spotify pipeline: extract consumer → lang-detect → VADER + trigger overrides."""
+    analyzer = load_vader()
+    df = df.copy()
+    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
+    df["ConsumerOnly"] = df[text_col].apply(_spotify_extract_consumer)
+    df["Language"] = df["ConsumerOnly"].apply(_spotify_detect_language)
+    df["Text_For_Analysis"] = df["ConsumerOnly"]
+
+    n = len(df)
+    compounds, confidences, sentiments, sources = [], [], [], []
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
+        norm_id = row["_id_norm"]
+        text = row["ConsumerOnly"]
+        lang = row["Language"]
+
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            compounds.append(score); confidences.append(1.0)
+            sentiments.append(label); sources.append("Validation")
+            continue
+
+        sources.append("Model")
+        if lang != "en" or not isinstance(text, str) or not text.strip():
+            compounds.append(0.0); confidences.append(0.0)
+            sentiments.append("Neutral"); continue
+
+        vader_score = get_vader_compound(text, analyzer)
+        if abs(vader_score) < 0.05:
+            vader_score = 0.0
+        adjusted = _spotify_adjust_score(text, vader_score)
+        compounds.append(round(adjusted, 3))
+        confidences.append(0.7)
+        sentiments.append(classify_sentiment(adjusted))
+
+    if progress_cb:
+        progress_cb(n, n)
+
+    df["consumer_score"]     = compounds
+    df["confidence"]         = confidences
+    df["consumer_sentiment"] = sentiments
+    df["validation_source"]  = sources
+    df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_spotify_neg_kw)
+    return df
+
+
 # ── Unified dispatcher ────────────────────────────────────────────────────────
 def run_analysis(df, domain, id_col, text_col, validation_dict, progress_cb=None):
     """Route to domain-specific analysis pipeline."""
     if domain == "hilton":
         return run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb)
+    elif domain == "netflix":
+        return run_netflix_analysis(df, id_col, text_col, validation_dict, progress_cb)
+    elif domain == "spotify":
+        return run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb)
     else:
         return run_ppt_analysis(df, id_col, text_col, validation_dict, progress_cb)
 
@@ -1665,8 +2125,13 @@ elif page == "Keyword Analysis":
     st.divider()
     shdr("Keywords by Issue Category", "📋")
     _active_domain = st.session_state.get("_domain", "ppt")
-    _kw_dict = HILTON_NEGATIVE_KEYWORDS if _active_domain == "hilton" else NEGATIVE_KEYWORDS
-    _dict_label = "Hilton" if _active_domain == "hilton" else "PPT"
+    _kw_dict_map = {
+        "ppt":     (NEGATIVE_KEYWORDS,         "PPT"),
+        "hilton":  (HILTON_NEGATIVE_KEYWORDS,  "Hilton"),
+        "netflix": (NETFLIX_NEGATIVE_KEYWORDS, "Netflix"),
+        "spotify": (SPOTIFY_NEGATIVE_KEYWORDS, "Spotify"),
+    }
+    _kw_dict, _dict_label = _kw_dict_map.get(_active_domain, (NEGATIVE_KEYWORDS, "PPT"))
     st.markdown(f"Each category reflects the issue group from the **{_dict_label}** keyword dictionary.")
 
     cat_data = []

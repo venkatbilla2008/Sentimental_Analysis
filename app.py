@@ -17,13 +17,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-try:
-    import polars as pl
-    _POLARS_OK = True
-except ImportError:
-    _POLARS_OK = False
-
-CHUNK_SIZE = 500  # rows per processing batch
 
 warnings.filterwarnings("ignore")
 
@@ -652,239 +645,79 @@ SENTIMENT_TO_SCORE = {
     "Neutral": 0.0, "Negative": -0.55, "Very Negative": -0.85,
 }
 
-# ── Vectorized trigger masks (Polars) ──────────────────────────────────────────
-def _build_polars_masks(text_series_lower):
-    """
-    Run all 5 sentiment tiers as vectorized Polars str.contains across entire column.
-    Returns dict of bool numpy arrays — zero Python loops over rows.
-    """
-    s = text_series_lower  # pl.Series, already lowercased
-    masks = {}
-    for name, patterns in [
-        ("very_neg",  VERY_NEGATIVE_TRIGGERS),
-        ("very_pos",  VERY_POSITIVE_TRIGGERS),
-        ("positive",  POSITIVE_TRIGGERS),
-        ("negative",  NEGATIVE_TRIGGERS),
-        ("neutral",   NEUTRAL_TRIGGERS),
-    ]:
-        combined = "|".join(re.escape(p) for p in patterns)
-        masks[name] = s.str.contains(combined).to_numpy()
-    # Strong-negative sub-mask
-    strong_combined = "|".join(re.escape(p) for p in STRONG_NEGATIVE_PHRASES)
-    masks["strong_neg"] = s.str.contains(strong_combined).to_numpy()
-    # Positive word count mask (>=2 positive words → Very Positive)
-    pos_word_pat = r"\b(thank|thanks|appreciate|perfect|helpful|great|excellent|awesome)\b"
-    masks["pos_word_count"] = s.str.count_matches(pos_word_pat).to_numpy()
-    return masks
-
-
-def _vectorized_score_batch(texts_pl, id_norms, validation_dict):
-    """
-    Score an entire batch (pl.Series) using vectorized Polars masks + NumPy.
-    Returns arrays: compounds, confidences, sentiments, sources.
-    """
-    n = len(texts_pl)
-    tlow = texts_pl.str.to_lowercase()
-
-    # Pre-allocate output arrays
-    compounds   = np.zeros(n, dtype=np.float32)
-    confidences = np.zeros(n, dtype=np.float32)
-    sentiments  = np.empty(n, dtype=object)
-    sources     = np.empty(n, dtype=object)
-    sentiments[:] = "Neutral"
-    sources[:]    = "Model"
-
-    # Step 1 — validation override mask (vectorized dict lookup)
-    val_labels = np.array([validation_dict.get(nid) for nid in id_norms], dtype=object)
-    val_mask   = val_labels != None  # noqa
-    if val_mask.any():
-        for i in np.where(val_mask)[0]:
-            lbl = val_labels[i]
-            compounds[i]   = SENTIMENT_TO_SCORE.get(lbl, 0.0)
-            confidences[i] = 1.0
-            sentiments[i]  = lbl
-            sources[i]     = "Validation"
-
-    # Step 2 — blank mask (Polars vectorized)
-    blank_mask = (tlow.str.strip_chars().str.len_chars() == 0).to_numpy() & ~val_mask
-    # blanks stay Neutral / 0.0 / 0.0 (already initialized)
-
-    # Step 3 — rows to classify via rules
-    classify_mask = ~val_mask & ~blank_mask
-    if not classify_mask.any():
-        return compounds, confidences, sentiments, sources
-
-    # Build all trigger masks at once (vectorized over full column)
-    masks = _build_polars_masks(tlow)
-
-    ci = np.where(classify_mask)[0]
-
-    # Very Negative
-    m = masks["very_neg"][ci]
-    compounds[ci[m]]   = -0.85; confidences[ci[m]] = 0.95
-    sentiments[ci[m]]  = "Very Negative"
-
-    unset = ci[~m]
-    # Very Positive
-    m2 = masks["very_pos"][unset]
-    compounds[unset[m2]]  = 0.85; confidences[unset[m2]] = 0.95
-    sentiments[unset[m2]] = "Very Positive"
-
-    unset = unset[~m2]
-    # Positive (check word count for Very Positive upgrade)
-    m3 = masks["positive"][unset]
-    pos_idx = unset[m3]
-    pw = masks["pos_word_count"][pos_idx]
-    vp_idx = pos_idx[pw >= 2]; p_idx = pos_idx[pw < 2]
-    compounds[vp_idx]   = 0.75; confidences[vp_idx] = 0.90; sentiments[vp_idx] = "Very Positive"
-    compounds[p_idx]    = 0.35; confidences[p_idx]  = 0.80; sentiments[p_idx]  = "Positive"
-
-    unset = unset[~m3]
-    # Negative
-    m4 = masks["negative"][unset]
-    neg_idx = unset[m4]
-    strong = masks["strong_neg"][neg_idx]
-    compounds[neg_idx[strong]]   = -0.70; confidences[neg_idx[strong]] = 0.95
-    sentiments[neg_idx[strong]]  = "Very Negative"
-    compounds[neg_idx[~strong]]  = -0.55; confidences[neg_idx[~strong]] = 0.80
-    sentiments[neg_idx[~strong]] = "Negative"
-
-    unset = unset[~m4]
-    # Neutral
-    m5 = masks["neutral"][unset]
-    compounds[unset[m5]]   = 0.0; confidences[unset[m5]] = 0.80
-    sentiments[unset[m5]]  = "Neutral"
-
-    # Low-confidence rows → VADER (batch via list comprehension, not iterrows)
-    low_conf_mask = (confidences < 0.7) & classify_mask
-    vader_idx = np.where(low_conf_mask)[0]
-    if len(vader_idx):
-        analyzer = load_vader()
-        vader_texts = texts_pl.gather(vader_idx.tolist()).to_list()
-        for k, txt in zip(vader_idx, vader_texts):
-            if not isinstance(txt, str) or not txt.strip():
-                continue
-            v = get_vader_compound(txt, analyzer)
-            v = 0.0 if abs(v) < 0.05 else v
-            r_sc = float(compounds[k]) if confidences[k] > 0 else None
-            r_cf = float(confidences[k]) if confidences[k] > 0 else 0.0
-            final = (r_sc * r_cf + v * (1 - r_cf)) if r_sc is not None else v
-            compounds[k]   = round(final, 3)
-            confidences[k] = 0.5
-            sentiments[k]  = classify_sentiment(final)
-
-    return compounds.tolist(), confidences.tolist(), sentiments.tolist(), sources.tolist()
-
-
 def run_ppt_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    """
-    Performance-upgraded PPT pipeline.
-    Speaker extraction  → parallel via ThreadPoolExecutor
-    Text cleaning       → pandas vectorized str ops
-    Sentiment scoring   → Polars vectorized masks + NumPy (zero iterrows)
-    Keyword extraction  → vectorized regex on full column
-    Processing          → CHUNK_SIZE batches with progress reporting
-    """
-    import concurrent.futures
-
+    analyzer = load_vader()
     df = df.copy()
-    n  = len(df)
 
-    # ── Step 1: ID normalisation (pandas vectorized) ───────────────────────
-    df["_id_norm"] = (df[id_col].astype(str)
-                      .str.strip()
-                      .str.replace(" ", "", regex=False))
+    # Normalize IDs
+    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
 
-    # ── Step 2: Speaker extraction — parallel threads ──────────────────────
-    if progress_cb: progress_cb(0, n)
-    texts_raw = df[text_col].tolist()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        customer_texts = list(pool.map(extract_customer_messages, texts_raw))
-    df["CustomerOnly"] = customer_texts
-    if progress_cb: progress_cb(int(n * 0.15), n)
-
-    # ── Step 3: Text cleaning — pandas vectorized str ops ─────────────────
-    # Remove noise phrases via vectorized str.replace on the whole column
-    noise_pat = "|".join(REMOVE_PATTERNS)
-    df["CustomerOnly_Cleaned"] = (df["CustomerOnly"]
-                                   .fillna("")
-                                   .str.replace(noise_pat, "", regex=True, flags=re.IGNORECASE)
-                                   .str.strip())
-    # Remove PT domain terms vectorized
-    pt_pat = "|".join(re.escape(t) for t in sorted(PT_CONTENT_SET, key=len, reverse=True))
-    df["CustomerOnly_Cleaned"] = (df["CustomerOnly_Cleaned"]
-                                   .str.replace(pt_pat, "", regex=True, flags=re.IGNORECASE)
-                                   .str.replace(r"\s+", " ", regex=True)
-                                   .str.strip())
-    # Drop texts that are too short
-    mask_short = df["CustomerOnly_Cleaned"].str.len() < 5
-    df.loc[mask_short, "CustomerOnly_Cleaned"] = ""
+    # Extract + clean customer text
+    df["CustomerOnly"] = df[text_col].apply(extract_customer_messages)
+    df["CustomerOnly_Cleaned"] = df["CustomerOnly"].apply(aggressive_clean_text)
+    df["CustomerOnly_Cleaned"] = df["CustomerOnly_Cleaned"].apply(remove_pt_content_names)
     df["Text_For_Analysis"] = df["CustomerOnly_Cleaned"]
-    if progress_cb: progress_cb(int(n * 0.30), n)
 
-    # ── Step 4: Vectorized scoring in CHUNK_SIZE batches ──────────────────
-    all_compounds, all_confidences, all_sentiments, all_sources = [], [], [], []
+    n = len(df)
+    compounds, confidences, sentiments, sources = [], [], [], []
 
-    chunks = [df.iloc[i:i + CHUNK_SIZE] for i in range(0, n, CHUNK_SIZE)]
-    for ci, chunk in enumerate(chunks):
-        texts_pl  = pl.Series(chunk["Text_For_Analysis"].fillna("").tolist()) if _POLARS_OK                     else None
-        id_norms  = chunk["_id_norm"].tolist()
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
 
-        if _POLARS_OK and texts_pl is not None:
-            c, cf, s, src = _vectorized_score_batch(texts_pl, id_norms, validation_dict)
-        else:
-            # Fallback: original row loop (no Polars)
-            analyzer = load_vader()
-            c, cf, s, src = [], [], [], []
-            for _, row in chunk.iterrows():
-                nid  = row["_id_norm"]
-                text = row["Text_For_Analysis"]
-                if nid in validation_dict:
-                    lbl = validation_dict[nid]
-                    c.append(SENTIMENT_TO_SCORE.get(lbl, 0.0))
-                    cf.append(1.0); s.append(lbl); src.append("Validation")
-                    continue
-                src.append("Model")
-                if not isinstance(text, str) or not text.strip():
-                    c.append(0.0); cf.append(0.0); s.append("Neutral"); continue
-                rs, rc = classify_by_rules(text)
-                if rs is not None and rc > 0.7:
-                    c.append(round(rs, 3)); cf.append(rc); s.append(classify_sentiment(rs))
-                else:
-                    v = get_vader_compound(text, analyzer)
-                    v = 0.0 if abs(v) < 0.05 else v
-                    final = (rs * rc + v * (1 - rc)) if rs is not None else v
-                    c.append(round(final, 3)); cf.append(0.5); s.append(classify_sentiment(final))
+        norm_id = row["_id_norm"]
+        text = row["Text_For_Analysis"]
 
-        all_compounds.extend(c); all_confidences.extend(cf)
-        all_sentiments.extend(s); all_sources.extend(src)
+        # Priority 1 — validation override
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            compounds.append(score)
+            confidences.append(1.0)
+            sentiments.append(label)
+            sources.append("Validation")
+            continue
 
-        if progress_cb:
-            progress_cb(min(int(n * 0.30) + int((ci + 1) / len(chunks) * n * 0.55), int(n * 0.85)), n)
+        sources.append("Model")
 
-    df["consumer_score"]     = all_compounds
-    df["confidence"]         = all_confidences
-    df["consumer_sentiment"] = all_sentiments
-    df["validation_source"]  = all_sources
-
-    # ── Step 5: Keyword extraction — vectorized regex on full column ───────
-    neg_pat_str = "|".join(re.escape(k) for k in ALL_NEGATIVE_KEYWORDS_SORTED)
-    neg_pat_vec = re.compile(neg_pat_str, re.IGNORECASE)
-
-    def _extract_kw_fast(text):
+        # Empty text
         if not isinstance(text, str) or not text.strip():
-            return ""
-        matches = neg_pat_vec.findall(text)
-        seen, found = set(), []
-        for m in matches:
-            ml = m.lower()
-            if ml not in seen:
-                seen.add(ml); found.append(m)
-        return "; ".join(found)
+            compounds.append(0.0)
+            confidences.append(0.0)
+            sentiments.append("Neutral")
+            continue
 
-    df["Negative_Keywords"] = df["Text_For_Analysis"].apply(_extract_kw_fast)
+        # Priority 2 — rule-based
+        rule_score, confidence = classify_by_rules(text)
 
-    if progress_cb: progress_cb(n, n)
+        if rule_score is not None and confidence > 0.7:
+            compounds.append(round(rule_score, 3))
+            confidences.append(confidence)
+            sentiments.append(classify_sentiment(rule_score))
+        else:
+            # Priority 3 — VADER
+            vader_score = get_vader_compound(text, analyzer)
+            if abs(vader_score) < 0.05:
+                vader_score = 0.0
+            if rule_score is not None:
+                final = (rule_score * confidence) + (vader_score * (1 - confidence))
+            else:
+                final = vader_score
+            compounds.append(round(final, 3))
+            confidences.append(0.5)
+            sentiments.append(classify_sentiment(final))
+
+    if progress_cb:
+        progress_cb(n, n)
+
+    df["consumer_score"]     = compounds
+    df["confidence"]         = confidences
+    df["consumer_sentiment"] = sentiments
+    df["validation_source"]  = sources
+
+    # Negative keyword extraction
+    df["Negative_Keywords"] = df["Text_For_Analysis"].apply(extract_negative_keywords)
+
     return df
 
 
@@ -1250,22 +1083,39 @@ def run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb=None)
     n = len(df)
     compounds, confidences, sentiments, sources, translated_texts, methods_log = [], [], [], [], [], []
 
-    # ── Parallel cleaning via ThreadPoolExecutor ─────────────────────────
-    import concurrent.futures
-    cleaned_list = df["Cleaned_Comments"].fillna("").tolist()
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
 
-    # Batch process: validation override + blank check first (vectorized)
-    id_norms   = df["_id_norm"].tolist()
-    val_labels = [validation_dict.get(nid) for nid in id_norms]
+        norm_id = row["_id_norm"]
+        cleaned = row["Cleaned_Comments"]
 
-    # Parallel translation for non-English rows (I/O bound — threads ideal)
-    def _process_hilton_row(args):
-        cleaned, val_label = args
-        if val_label is not None:
-            return ("validation", val_label, SENTIMENT_TO_SCORE.get(val_label, 0.0) * 10, 1.0, "")
+        # Validation override
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            # Re-scale to -10…+10 for Hilton; keep raw labels
+            compounds.append(score * 10)
+            confidences.append(1.0)
+            sentiments.append(label)
+            sources.append("Validation")
+            translated_texts.append("")
+            methods_log.append("validation")
+            continue
+
+        sources.append("Model")
+
+        # Meaningless check
         is_mless, _ = hilton_is_meaningless(cleaned)
         if is_mless or not cleaned:
-            return ("blank", "Neutral", 0.0, 0.0, "")
+            compounds.append(0.0)
+            confidences.append(0.0)
+            sentiments.append("Neutral")
+            translated_texts.append("")
+            methods_log.append("blank")
+            continue
+
+        # Language detection + translation
         lang, lang_conf = hilton_detect_language(cleaned)
         text_for_scoring = cleaned
         trans = ""
@@ -1274,23 +1124,14 @@ def run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb=None)
             if did_translate:
                 text_for_scoring = translated
                 trans = translated
+        translated_texts.append(trans)
+
+        # Hybrid scoring
         score, conf, _ = _hilton_hybrid_score(text_for_scoring)
-        return ("hybrid", classify_sentiment_hilton(score), round(score, 3), round(conf, 3), trans)
-
-    args_list = list(zip(cleaned_list, val_labels))
-    chunks = [args_list[i:i + CHUNK_SIZE] for i in range(0, n, CHUNK_SIZE)]
-    results = []
-    for ci, chunk in enumerate(chunks):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            results.extend(list(pool.map(_process_hilton_row, chunk)))
-        if progress_cb:
-            progress_cb(min(int((ci + 1) / len(chunks) * n * 0.90), n - 1), n)
-
-    for method, label, score, conf, trans in results:
-        src_tag = "Validation" if method == "validation" else "Model"
-        compounds.append(score); confidences.append(conf)
-        sentiments.append(label); sources.append(src_tag)
-        translated_texts.append(trans); methods_log.append(method)
+        compounds.append(round(score, 3))
+        confidences.append(round(conf, 3))
+        sentiments.append(classify_sentiment_hilton(score))
+        methods_log.append("hybrid")
 
     if progress_cb:
         progress_cb(n, n)
@@ -1545,58 +1386,46 @@ def run_netflix_analysis(df, id_col, text_col, validation_dict, progress_cb=None
     df["Text_For_Analysis"] = df["CustomerOnly_Cleaned"]
 
     n = len(df)
+    compounds, confidences, sentiments, sources = [], [], [], []
 
-    # ── Vectorized scoring via Polars (mirrors PPT pipeline) ─────────────
-    if _POLARS_OK:
-        texts_pl  = pl.Series(df["Text_For_Analysis"].fillna("").tolist())
-        id_norms  = df["_id_norm"].tolist()
-        tlow = texts_pl.str.to_lowercase()
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
+        norm_id = row["_id_norm"]
+        text = row["Text_For_Analysis"]
 
-        # Netflix trigger masks (vectorized)
-        def _netflix_masks(tlow_series):
-            masks = {}
-            for name, pats in [
-                ("very_neg",  NETFLIX_VERY_NEGATIVE_TRIGGERS),
-                ("very_pos",  NETFLIX_VERY_POSITIVE_TRIGGERS),
-                ("positive",  NETFLIX_POSITIVE_TRIGGERS),
-                ("negative",  NETFLIX_NEGATIVE_TRIGGERS),
-                ("neutral",   NETFLIX_NEUTRAL_TRIGGERS),
-            ]:
-                combined = "|".join(re.escape(p) for p in pats)
-                masks[name] = tlow_series.str.contains(combined).to_numpy()
-            strong = "|".join(re.escape(p) for p in NETFLIX_STRONG_NEGATIVE)
-            masks["strong_neg"] = tlow_series.str.contains(strong).to_numpy()
-            return masks
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            compounds.append(score); confidences.append(1.0)
+            sentiments.append(label); sources.append("Validation")
+            continue
 
-        chunks = [df.iloc[i:i + CHUNK_SIZE] for i in range(0, n, CHUNK_SIZE)]
-        all_compounds, all_confidences, all_sentiments, all_sources = [], [], [], []
-        for ci, chunk in enumerate(chunks):
-            tp = pl.Series(chunk["Text_For_Analysis"].fillna("").tolist())
-            c, cf, s, src = _vectorized_score_batch(tp, chunk["_id_norm"].tolist(), validation_dict)
-            all_compounds.extend(c); all_confidences.extend(cf)
-            all_sentiments.extend(s); all_sources.extend(src)
-            if progress_cb: progress_cb(min(int((ci+1)/len(chunks)*n*0.85), n-1), n)
-        compounds, confidences, sentiments, sources = all_compounds, all_confidences, all_sentiments, all_sources
-    else:
-        compounds, confidences, sentiments, sources = [], [], [], []
-        for i, (_, row) in enumerate(df.iterrows()):
-            if progress_cb and i % max(1, n // 100) == 0: progress_cb(i, n)
-            norm_id = row["_id_norm"]; text = row["Text_For_Analysis"]
-            if norm_id in validation_dict:
-                lbl = validation_dict[norm_id]; score = SENTIMENT_TO_SCORE.get(lbl, 0.0)
-                compounds.append(score); confidences.append(1.0); sentiments.append(lbl); sources.append("Validation"); continue
-            sources.append("Model")
-            if not isinstance(text, str) or not text.strip():
-                compounds.append(0.0); confidences.append(0.0); sentiments.append("Neutral"); continue
-            rule_score, conf = _netflix_classify_by_rules(text)
-            if rule_score is not None and conf > 0.7:
-                compounds.append(round(rule_score, 3)); confidences.append(conf); sentiments.append(classify_sentiment(rule_score))
+        sources.append("Model")
+        if not isinstance(text, str) or not text.strip():
+            compounds.append(0.0); confidences.append(0.0)
+            sentiments.append("Neutral"); continue
+
+        rule_score, conf = _netflix_classify_by_rules(text)
+        if rule_score is not None and conf > 0.7:
+            compounds.append(round(rule_score, 3))
+            confidences.append(conf)
+            sentiments.append(classify_sentiment(rule_score))
+        else:
+            vader_score = get_vader_compound(text, analyzer)
+            if abs(vader_score) < 0.05:
+                vader_score = 0.0
+            if rule_score is not None:
+                final = (rule_score * conf) + (vader_score * (1 - conf))
             else:
-                v = get_vader_compound(text, analyzer); v = 0.0 if abs(v) < 0.05 else v
-                final = (rule_score * conf + v * (1 - conf)) if rule_score is not None else v
-                compounds.append(round(final, 3)); confidences.append(0.5); sentiments.append(classify_sentiment(final))
+                final = vader_score
+            compounds.append(round(final, 3))
+            confidences.append(0.5)
+            sentiments.append(classify_sentiment(final))
 
-    if progress_cb: progress_cb(n, n)
+    if progress_cb:
+        progress_cb(n, n)
+
     df["consumer_score"]     = compounds
     df["confidence"]         = confidences
     df["consumer_sentiment"] = sentiments
@@ -1723,36 +1552,42 @@ def run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb=None
     df["Text_For_Analysis"] = df["ConsumerOnly"]
 
     n = len(df)
+    compounds, confidences, sentiments, sources = [], [], [], []
 
-    # ── Vectorized VADER on English rows via NumPy batching ───────────────
-    id_norms  = df["_id_norm"].tolist()
-    texts     = df["ConsumerOnly"].fillna("").tolist()
-    langs     = df["Language"].tolist()
-    val_labels = [validation_dict.get(nid) for nid in id_norms]
+    for i, (_, row) in enumerate(df.iterrows()):
+        if progress_cb and i % max(1, n // 100) == 0:
+            progress_cb(i, n)
+        norm_id = row["_id_norm"]
+        text = row["ConsumerOnly"]
+        lang = row["Language"]
 
-    compounds   = np.zeros(n, dtype=np.float32)
-    confidences = np.zeros(n, dtype=np.float32)
-    sentiments  = np.full(n, "Neutral", dtype=object)
-    sources     = np.full(n, "Model", dtype=object)
-
-    for i, (text, lang, val_lbl) in enumerate(zip(texts, langs, val_labels)):
-        if val_lbl is not None:
-            compounds[i]   = SENTIMENT_TO_SCORE.get(val_lbl, 0.0)
-            confidences[i] = 1.0; sentiments[i] = val_lbl; sources[i] = "Validation"
+        if norm_id in validation_dict:
+            label = validation_dict[norm_id]
+            score = SENTIMENT_TO_SCORE.get(label, 0.0)
+            compounds.append(score); confidences.append(1.0)
+            sentiments.append(label); sources.append("Validation")
             continue
-        if lang != "en" or not isinstance(text, str) or not text.strip():
-            continue  # stays Neutral / 0
-        v = get_vader_compound(text, analyzer); v = 0.0 if abs(v) < 0.05 else v
-        adj = _spotify_adjust_score(text, v)
-        compounds[i] = round(adj, 3); confidences[i] = 0.7
-        sentiments[i] = classify_sentiment(adj)
-        if progress_cb and i % max(1, n // 50) == 0: progress_cb(i, n)
 
-    if progress_cb: progress_cb(n, n)
-    df["consumer_score"]     = compounds.tolist()
-    df["confidence"]         = confidences.tolist()
-    df["consumer_sentiment"] = sentiments.tolist()
-    df["validation_source"]  = sources.tolist()
+        sources.append("Model")
+        if lang != "en" or not isinstance(text, str) or not text.strip():
+            compounds.append(0.0); confidences.append(0.0)
+            sentiments.append("Neutral"); continue
+
+        vader_score = get_vader_compound(text, analyzer)
+        if abs(vader_score) < 0.05:
+            vader_score = 0.0
+        adjusted = _spotify_adjust_score(text, vader_score)
+        compounds.append(round(adjusted, 3))
+        confidences.append(0.7)
+        sentiments.append(classify_sentiment(adjusted))
+
+    if progress_cb:
+        progress_cb(n, n)
+
+    df["consumer_score"]     = compounds
+    df["confidence"]         = confidences
+    df["consumer_sentiment"] = sentiments
+    df["validation_source"]  = sources
     df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_spotify_neg_kw)
     return df
 
@@ -1799,30 +1634,8 @@ def _mfig(fig, h=380):
 
 @st.cache_data(show_spinner=False)
 def _read_file(raw, name):
-    """Polars-accelerated file reader with snappy-parquet in-memory optimization."""
     buf = io.BytesIO(raw)
-    ext = Path(name).suffix.lower()
-    if _POLARS_OK:
-        try:
-            if ext == ".csv":
-                df_pl = pl.read_csv(buf)
-            elif ext in (".xlsx", ".xls"):
-                df_pl = pl.from_pandas(pd.read_excel(io.BytesIO(raw)))
-            elif ext == ".parquet":
-                df_pl = pl.read_parquet(buf)
-            else:
-                df_pl = pl.from_pandas(pd.read_csv(buf))
-            # Re-encode as snappy parquet in memory for faster downstream ops
-            if len(df_pl) >= 1000 and ext != ".parquet":
-                b = io.BytesIO()
-                df_pl.write_parquet(b, compression="snappy")
-                b.seek(0)
-                df_pl = pl.read_parquet(b)
-            return df_pl.to_pandas()
-        except Exception:
-            buf.seek(0)
-    # Fallback: plain pandas
-    return pd.read_csv(buf) if ext == ".csv" else pd.read_excel(io.BytesIO(raw))
+    return pd.read_csv(buf) if name.endswith(".csv") else pd.read_excel(buf)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1866,7 +1679,7 @@ with st.sidebar:
     for p in PAGES:
         active = st.session_state._page == p
         if st.button(p, key=f"nav_{p}", icon=NAV_ICONS[p],
-                     use_container_width=True,
+                     width='stretch',
                      type="primary" if active else "secondary"):
             st.session_state._page = p
             st.rerun()
@@ -1973,7 +1786,7 @@ if page == "Upload & Analyse":
         st.stop()
 
     with st.expander("Preview raw data (first 5 rows)"):
-        st.dataframe(df_raw[[id_col, text_col]].head(5), use_container_width=True)
+        st.dataframe(df_raw[[id_col, text_col]].head(5), width='stretch')
 
     # Validation summary
     validation_dict = {}
@@ -2000,7 +1813,7 @@ if page == "Upload & Analyse":
         _btn_label = DOMAIN_CONFIG[domain]["label"].split(" — ")[0]
         run = st.button(
             f"🚀 Run {_btn_label} Sentiment Analysis  ({len(df_raw):,} records)",
-            type="primary", use_container_width=True
+            type="primary", width='stretch'
         )
 
     if run:
@@ -2097,7 +1910,7 @@ elif page == "Reports & Insights":
             title=dict(text="Sentiment Distribution", font=dict(size=15, color="#1E2D33"), x=0),
             showlegend=False,
         )
-        st.plotly_chart(fig_bar, use_container_width=True, key="rpt_bar")
+        st.plotly_chart(fig_bar, width='stretch', key="rpt_bar")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -2115,7 +1928,7 @@ elif page == "Reports & Insights":
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
             )
-            st.plotly_chart(fig_pie, use_container_width=True, key="rpt_pie")
+            st.plotly_chart(fig_pie, width='stretch', key="rpt_pie")
 
         with c2:
             # Source breakdown donut
@@ -2135,7 +1948,7 @@ elif page == "Reports & Insights":
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
             )
-            st.plotly_chart(fig_src, use_container_width=True, key="rpt_src")
+            st.plotly_chart(fig_src, width='stretch', key="rpt_src")
 
     # ── Score Analysis tab ────────────────────────────────────────────────────
     with tab_score:
@@ -2155,7 +1968,7 @@ elif page == "Reports & Insights":
                 title=dict(text="Compound Score Distribution", font=dict(size=14, color="#1E2D33"), x=0),
                 bargap=0.05,
             )
-            st.plotly_chart(fig_hist, use_container_width=True, key="rpt_hist")
+            st.plotly_chart(fig_hist, width='stretch', key="rpt_hist")
 
         with c2:
             conf_bins = pd.cut(
@@ -2178,7 +1991,7 @@ elif page == "Reports & Insights":
                 title=dict(text="Confidence Band Distribution", font=dict(size=14, color="#1E2D33"), x=0),
                 showlegend=False,
             )
-            st.plotly_chart(fig_conf, use_container_width=True, key="rpt_conf")
+            st.plotly_chart(fig_conf, width='stretch', key="rpt_conf")
 
         # Sentiment by source stacked bar
         shdr("Sentiment by Classification Source", "📈")
@@ -2196,7 +2009,7 @@ elif page == "Reports & Insights":
             barmode="stack", title=dict(text="Sentiment by Source", font=dict(size=14, color="#1E2D33"), x=0),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
         )
-        st.plotly_chart(fig_ss, use_container_width=True, key="rpt_ss")
+        st.plotly_chart(fig_ss, width='stretch', key="rpt_ss")
 
     # ── Full Results tab ──────────────────────────────────────────────────────
     with tab_data:
@@ -2214,8 +2027,12 @@ elif page == "Reports & Insights":
             id_col, text_col, "CustomerOnly", "consumer_sentiment",
             "consumer_score", "confidence", "validation_source", "Negative_Keywords"
         ] if c in disp.columns]
-        st.markdown(f'<span class="badge b-info">{len(disp):,} rows shown</span>', unsafe_allow_html=True)
-        st.dataframe(disp[show_cols].reset_index(drop=True), use_container_width=True, height=420)
+        MAX_DISPLAY = 500
+        disp_capped = disp[show_cols].head(MAX_DISPLAY).reset_index(drop=True)
+        badge_extra = (f' &nbsp;<span class="badge b-warn">Showing first {MAX_DISPLAY:,} — download for all rows</span>'
+                       if len(disp) > MAX_DISPLAY else '')
+        st.markdown(f'<span class="badge b-info">{len(disp):,} rows</span>' + badge_extra, unsafe_allow_html=True)
+        st.dataframe(disp_capped, width='stretch', height=420)
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.divider()
@@ -2227,7 +2044,7 @@ elif page == "Reports & Insights":
             "⬇️ Download CSV",
             data=out.to_csv(index=False).encode(),
             file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv", use_container_width=True, key="dl_csv",
+            mime="text/csv", width='stretch', key="dl_csv",
         )
     with e2:
         xls_buf = io.BytesIO()
@@ -2257,7 +2074,7 @@ elif page == "Reports & Insights":
             data=xls_buf.getvalue(),
             file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key="dl_excel",
+            width='stretch', key="dl_excel",
         )
 
 
@@ -2306,7 +2123,7 @@ elif page == "Keyword Analysis":
         title=dict(text=f"Top {top_n} Negative Keywords / Phrases", font=dict(size=15, color="#1E2D33"), x=0),
         showlegend=False, coloraxis_showscale=False,
     )
-    st.plotly_chart(fig_kw, use_container_width=True, key="kw_main")
+    st.plotly_chart(fig_kw, width='stretch', key="kw_main")
 
     # ── By category ───────────────────────────────────────────────────────────
     st.divider()
@@ -2353,7 +2170,7 @@ elif page == "Keyword Analysis":
             title=dict(text="Issue Category Frequency", font=dict(size=14, color="#1E2D33"), x=0),
             showlegend=False, coloraxis_showscale=False,
         )
-        st.plotly_chart(fig_cat, use_container_width=True, key="kw_cat")
+        st.plotly_chart(fig_cat, width='stretch', key="kw_cat")
 
     # ── Filter by sentiment ───────────────────────────────────────────────────
     st.divider()
@@ -2366,7 +2183,7 @@ elif page == "Keyword Analysis":
     if not kw2.empty:
         kw2_df = kw2.value_counts().head(25).reset_index()
         kw2_df.columns = ["Keyword", "Count"]
-        st.dataframe(kw2_df, use_container_width=True, hide_index=True)
+        st.dataframe(kw2_df.head(500), width='stretch', hide_index=True)
     else:
         st.info(f"No keywords found for {sent_pick}.")
 
@@ -2399,15 +2216,18 @@ elif page == "Audit Trail":
     elif "Medium" in f_conf: ad = ad[(ad["confidence"] >= 0.3) & (ad["confidence"] <= 0.7)]
     elif "Low"    in f_conf: ad = ad[ad["confidence"] < 0.3]
 
-    st.markdown(f'<span class="badge b-info">{len(ad):,} rows match filters</span>', unsafe_allow_html=True)
-
+    MAX_AUDIT = 500
     show = [c for c in [
         id_col, text_col,
         "CustomerOnly", "Cleaned_Comments", "Translated_Text", "Text_For_Analysis",
         "consumer_sentiment", "consumer_score",
         "confidence", "validation_source", "Negative_Keywords"
     ] if c in ad.columns]
-    st.dataframe(ad[show].reset_index(drop=True), use_container_width=True, height=480)
+    ad_capped = ad[show].head(MAX_AUDIT).reset_index(drop=True)
+    badge_extra = (f' &nbsp;<span class="badge b-warn">Showing first {MAX_AUDIT:,} — export for all rows</span>'
+                   if len(ad) > MAX_AUDIT else '')
+    st.markdown(f'<span class="badge b-info">{len(ad):,} rows match filters</span>' + badge_extra, unsafe_allow_html=True)
+    st.dataframe(ad_capped, width='stretch', height=480)
 
     # Export filtered
     _audit_domain = st.session_state.get("_domain", "sentiment")
@@ -2415,7 +2235,7 @@ elif page == "Audit Trail":
         "⬇️ Export filtered audit CSV",
         data=ad.to_csv(index=False).encode(),
         file_name=f"{_audit_domain}_audit_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv", use_container_width=True, key="at_dl",
+        mime="text/csv", width='stretch', key="at_dl",
     )
 
 

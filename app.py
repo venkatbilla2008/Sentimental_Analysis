@@ -161,6 +161,22 @@ def load_vader():
     return SentimentIntensityAnalyzer()
 
 
+@st.cache_resource
+def _load_bert_optional():
+    """Load DistilBERT for borderline Spotify corrections. Returns None if unavailable."""
+    try:
+        import torch
+        from transformers import pipeline as hf_pipeline
+        device = 0 if torch.cuda.is_available() else -1
+        return hf_pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english",
+            device=device,
+        )
+    except Exception:
+        return None  # Transformers not installed — BERT step skipped silently
+
+
 # ── PT Content (domain terms to strip) ───────────────────────────────────────
 PT_CONTENT_SET = {
     "professional physical therapy", "professional pt", "physical therapy",
@@ -569,8 +585,8 @@ def classify_sentiment(score):
         return "Neutral"
     if score >= 0.60:   return "Very Positive"
     if score >= 0.20:   return "Positive"
-    if score >= -0.20:  return "Neutral"
-    if score >= -0.60:  return "Negative"
+    if score > -0.20:   return "Neutral"   # exclusive (matches Spotify notebook)
+    if score > -0.60:   return "Negative"
     return "Very Negative"
 
 
@@ -1543,54 +1559,101 @@ def _extract_spotify_neg_kw(text):
 
 
 def run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    """Spotify pipeline: extract consumer → lang-detect → VADER + trigger overrides."""
+    """
+    Spotify pipeline — mirrors notebook exactly:
+      1. Extract Consumer messages from pipe-delimited transcripts
+      2. Language detection (English only scored)
+      3. VADER scoring with trigger overrides
+      4. BERT correction for borderline scores (-0.1 to +0.1)
+      5. Final trigger re-enforcement after BERT (always wins)
+    """
     analyzer = load_vader()
     df = df.copy()
     df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
+
+    # Step 1 — extract Consumer messages from pipe-delimited format
     df["ConsumerOnly"] = df[text_col].apply(_spotify_extract_consumer)
+    # Step 2 — language detection
     df["Language"] = df["ConsumerOnly"].apply(_spotify_detect_language)
     df["Text_For_Analysis"] = df["ConsumerOnly"]
 
-    n = len(df)
-    compounds, confidences, sentiments, sources = [], [], [], []
+    n          = len(df)
+    id_norms   = df["_id_norm"].tolist()
+    texts      = df["ConsumerOnly"].fillna("").tolist()
+    langs      = df["Language"].tolist()
+    val_labels = [validation_dict.get(nid) for nid in id_norms]
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        if progress_cb and i % max(1, n // 100) == 0:
-            progress_cb(i, n)
-        norm_id = row["_id_norm"]
-        text = row["ConsumerOnly"]
-        lang = row["Language"]
+    compounds   = np.zeros(n, dtype=np.float32)
+    confidences = np.zeros(n, dtype=np.float32)
+    sentiments  = np.full(n, "Neutral", dtype=object)
+    sources     = np.full(n, "Model",   dtype=object)
 
-        if norm_id in validation_dict:
-            label = validation_dict[norm_id]
-            score = SENTIMENT_TO_SCORE.get(label, 0.0)
-            compounds.append(score); confidences.append(1.0)
-            sentiments.append(label); sources.append("Validation")
+    # Step 3 — VADER + trigger overrides
+    for i, (text, lang, val_lbl) in enumerate(zip(texts, langs, val_labels)):
+        if val_lbl is not None:
+            compounds[i]   = SENTIMENT_TO_SCORE.get(val_lbl, 0.0)
+            confidences[i] = 1.0
+            sentiments[i]  = val_lbl
+            sources[i]     = "Validation"
             continue
-
-        sources.append("Model")
         if lang != "en" or not isinstance(text, str) or not text.strip():
-            compounds.append(0.0); confidences.append(0.0)
-            sentiments.append("Neutral"); continue
+            continue  # non-English stays Neutral / 0
+        v   = get_vader_compound(text, analyzer)
+        v   = 0.0 if abs(v) < 0.05 else v
+        adj = _spotify_adjust_score(text, v)
+        compounds[i]   = round(adj, 3)
+        confidences[i] = 0.7
+        sentiments[i]  = classify_sentiment(adj)
+        if progress_cb and i % max(1, n // 50) == 0:
+            progress_cb(i, n)
 
-        vader_score = get_vader_compound(text, analyzer)
-        if abs(vader_score) < 0.05:
-            vader_score = 0.0
-        adjusted = _spotify_adjust_score(text, vader_score)
-        compounds.append(round(adjusted, 3))
-        confidences.append(0.7)
-        sentiments.append(classify_sentiment(adjusted))
+    df["consumer_score"]     = compounds.tolist()
+    df["confidence"]         = confidences.tolist()
+    df["consumer_sentiment"] = sentiments.tolist()
+    df["validation_source"]  = sources.tolist()
 
+    # Step 4 — BERT correction for borderline scores (-0.1 to +0.1)
+    # Only applied to English, non-validated, model-scored rows
+    _bert = _load_bert_optional()
+    if _bert is not None:
+        border_mask = (
+            df["consumer_score"].between(-0.1, 0.1)
+            & df["Language"].eq("en")
+            & df["validation_source"].eq("Model")
+        )
+        if border_mask.any():
+            texts_border = df.loc[border_mask, "ConsumerOnly"].tolist()
+            try:
+                bert_results = _bert(texts_border, batch_size=16, truncation=True)
+                for idx, result in zip(df.loc[border_mask].index, bert_results):
+                    lbl   = result["label"].lower()
+                    bconf = result["score"]
+                    if lbl == "positive":
+                        df.at[idx, "consumer_sentiment"] = "Positive"
+                        df.at[idx, "consumer_score"]     = round(bconf, 3)
+                        df.at[idx, "confidence"]         = round(bconf, 3)
+                    else:
+                        df.at[idx, "consumer_sentiment"] = "Negative"
+                        df.at[idx, "consumer_score"]     = round(-bconf, 3)
+                        df.at[idx, "confidence"]         = round(bconf, 3)
+            except Exception:
+                pass  # BERT failed gracefully — keep VADER scores
+
+    # Step 5 — Final trigger re-enforcement AFTER BERT (notebook Step 6)
+    # Triggers always win, even over BERT corrections
+    for idx, text in enumerate(df["ConsumerOnly"]):
+        if isinstance(text, str):
+            if _spotify_neg_trig.search(text):
+                df.at[idx, "consumer_score"]     = -0.6
+                df.at[idx, "consumer_sentiment"] = "Negative"
+            elif _spotify_neu_trig.search(text):
+                df.at[idx, "consumer_score"]     = 0.0
+                df.at[idx, "consumer_sentiment"] = "Neutral"
+
+    df["Negative_Keywords"] = df["Text_For_Analysis"].apply(_extract_spotify_neg_kw)
     if progress_cb:
         progress_cb(n, n)
-
-    df["consumer_score"]     = compounds
-    df["confidence"]         = confidences
-    df["consumer_sentiment"] = sentiments
-    df["validation_source"]  = sources
-    df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_spotify_neg_kw)
     return df
-
 
 # ── Unified dispatcher ────────────────────────────────────────────────────────
 def run_analysis(df, domain, id_col, text_col, validation_dict, progress_cb=None):
@@ -1679,7 +1742,7 @@ with st.sidebar:
     for p in PAGES:
         active = st.session_state._page == p
         if st.button(p, key=f"nav_{p}", icon=NAV_ICONS[p],
-                     width='stretch',
+                     use_container_width=True,
                      type="primary" if active else "secondary"):
             st.session_state._page = p
             st.rerun()
@@ -1786,7 +1849,7 @@ if page == "Upload & Analyse":
         st.stop()
 
     with st.expander("Preview raw data (first 5 rows)"):
-        st.dataframe(df_raw[[id_col, text_col]].head(5), width='stretch')
+        st.dataframe(df_raw[[id_col, text_col]].head(5), use_container_width=True)
 
     # Validation summary
     validation_dict = {}
@@ -1813,7 +1876,7 @@ if page == "Upload & Analyse":
         _btn_label = DOMAIN_CONFIG[domain]["label"].split(" — ")[0]
         run = st.button(
             f"🚀 Run {_btn_label} Sentiment Analysis  ({len(df_raw):,} records)",
-            type="primary", width='stretch'
+            type="primary", use_container_width=True
         )
 
     if run:
@@ -1910,7 +1973,7 @@ elif page == "Reports & Insights":
             title=dict(text="Sentiment Distribution", font=dict(size=15, color="#1E2D33"), x=0),
             showlegend=False,
         )
-        st.plotly_chart(fig_bar, width='stretch', key="rpt_bar")
+        st.plotly_chart(fig_bar, use_container_width=True, key="rpt_bar")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -1928,7 +1991,7 @@ elif page == "Reports & Insights":
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
             )
-            st.plotly_chart(fig_pie, width='stretch', key="rpt_pie")
+            st.plotly_chart(fig_pie, use_container_width=True, key="rpt_pie")
 
         with c2:
             # Source breakdown donut
@@ -1948,7 +2011,7 @@ elif page == "Reports & Insights":
                 showlegend=True,
                 legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
             )
-            st.plotly_chart(fig_src, width='stretch', key="rpt_src")
+            st.plotly_chart(fig_src, use_container_width=True, key="rpt_src")
 
     # ── Score Analysis tab ────────────────────────────────────────────────────
     with tab_score:
@@ -1968,7 +2031,7 @@ elif page == "Reports & Insights":
                 title=dict(text="Compound Score Distribution", font=dict(size=14, color="#1E2D33"), x=0),
                 bargap=0.05,
             )
-            st.plotly_chart(fig_hist, width='stretch', key="rpt_hist")
+            st.plotly_chart(fig_hist, use_container_width=True, key="rpt_hist")
 
         with c2:
             conf_bins = pd.cut(
@@ -1991,7 +2054,7 @@ elif page == "Reports & Insights":
                 title=dict(text="Confidence Band Distribution", font=dict(size=14, color="#1E2D33"), x=0),
                 showlegend=False,
             )
-            st.plotly_chart(fig_conf, width='stretch', key="rpt_conf")
+            st.plotly_chart(fig_conf, use_container_width=True, key="rpt_conf")
 
         # Sentiment by source stacked bar
         shdr("Sentiment by Classification Source", "📈")
@@ -2009,7 +2072,7 @@ elif page == "Reports & Insights":
             barmode="stack", title=dict(text="Sentiment by Source", font=dict(size=14, color="#1E2D33"), x=0),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
         )
-        st.plotly_chart(fig_ss, width='stretch', key="rpt_ss")
+        st.plotly_chart(fig_ss, use_container_width=True, key="rpt_ss")
 
     # ── Full Results tab ──────────────────────────────────────────────────────
     with tab_data:
@@ -2027,12 +2090,8 @@ elif page == "Reports & Insights":
             id_col, text_col, "CustomerOnly", "consumer_sentiment",
             "consumer_score", "confidence", "validation_source", "Negative_Keywords"
         ] if c in disp.columns]
-        MAX_DISPLAY = 500
-        disp_capped = disp[show_cols].head(MAX_DISPLAY).reset_index(drop=True)
-        badge_extra = (f' &nbsp;<span class="badge b-warn">Showing first {MAX_DISPLAY:,} — download for all rows</span>'
-                       if len(disp) > MAX_DISPLAY else '')
-        st.markdown(f'<span class="badge b-info">{len(disp):,} rows</span>' + badge_extra, unsafe_allow_html=True)
-        st.dataframe(disp_capped, width='stretch', height=420)
+        st.markdown(f'<span class="badge b-info">{len(disp):,} rows shown</span>', unsafe_allow_html=True)
+        st.dataframe(disp[show_cols].reset_index(drop=True), use_container_width=True, height=420)
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.divider()
@@ -2044,7 +2103,7 @@ elif page == "Reports & Insights":
             "⬇️ Download CSV",
             data=out.to_csv(index=False).encode(),
             file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv", width='stretch', key="dl_csv",
+            mime="text/csv", use_container_width=True, key="dl_csv",
         )
     with e2:
         xls_buf = io.BytesIO()
@@ -2074,7 +2133,7 @@ elif page == "Reports & Insights":
             data=xls_buf.getvalue(),
             file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width='stretch', key="dl_excel",
+            use_container_width=True, key="dl_excel",
         )
 
 
@@ -2123,7 +2182,7 @@ elif page == "Keyword Analysis":
         title=dict(text=f"Top {top_n} Negative Keywords / Phrases", font=dict(size=15, color="#1E2D33"), x=0),
         showlegend=False, coloraxis_showscale=False,
     )
-    st.plotly_chart(fig_kw, width='stretch', key="kw_main")
+    st.plotly_chart(fig_kw, use_container_width=True, key="kw_main")
 
     # ── By category ───────────────────────────────────────────────────────────
     st.divider()
@@ -2170,7 +2229,7 @@ elif page == "Keyword Analysis":
             title=dict(text="Issue Category Frequency", font=dict(size=14, color="#1E2D33"), x=0),
             showlegend=False, coloraxis_showscale=False,
         )
-        st.plotly_chart(fig_cat, width='stretch', key="kw_cat")
+        st.plotly_chart(fig_cat, use_container_width=True, key="kw_cat")
 
     # ── Filter by sentiment ───────────────────────────────────────────────────
     st.divider()
@@ -2183,7 +2242,7 @@ elif page == "Keyword Analysis":
     if not kw2.empty:
         kw2_df = kw2.value_counts().head(25).reset_index()
         kw2_df.columns = ["Keyword", "Count"]
-        st.dataframe(kw2_df.head(500), width='stretch', hide_index=True)
+        st.dataframe(kw2_df, use_container_width=True, hide_index=True)
     else:
         st.info(f"No keywords found for {sent_pick}.")
 
@@ -2216,18 +2275,15 @@ elif page == "Audit Trail":
     elif "Medium" in f_conf: ad = ad[(ad["confidence"] >= 0.3) & (ad["confidence"] <= 0.7)]
     elif "Low"    in f_conf: ad = ad[ad["confidence"] < 0.3]
 
-    MAX_AUDIT = 500
+    st.markdown(f'<span class="badge b-info">{len(ad):,} rows match filters</span>', unsafe_allow_html=True)
+
     show = [c for c in [
         id_col, text_col,
         "CustomerOnly", "Cleaned_Comments", "Translated_Text", "Text_For_Analysis",
         "consumer_sentiment", "consumer_score",
         "confidence", "validation_source", "Negative_Keywords"
     ] if c in ad.columns]
-    ad_capped = ad[show].head(MAX_AUDIT).reset_index(drop=True)
-    badge_extra = (f' &nbsp;<span class="badge b-warn">Showing first {MAX_AUDIT:,} — export for all rows</span>'
-                   if len(ad) > MAX_AUDIT else '')
-    st.markdown(f'<span class="badge b-info">{len(ad):,} rows match filters</span>' + badge_extra, unsafe_allow_html=True)
-    st.dataframe(ad_capped, width='stretch', height=480)
+    st.dataframe(ad[show].reset_index(drop=True), use_container_width=True, height=480)
 
     # Export filtered
     _audit_domain = st.session_state.get("_domain", "sentiment")
@@ -2235,7 +2291,7 @@ elif page == "Audit Trail":
         "⬇️ Export filtered audit CSV",
         data=ad.to_csv(index=False).encode(),
         file_name=f"{_audit_domain}_audit_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv", width='stretch', key="at_dl",
+        mime="text/csv", use_container_width=True, key="at_dl",
     )
 
 

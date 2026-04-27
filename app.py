@@ -917,11 +917,15 @@ with st.sidebar:
             st.session_state["sb_id"]   = _file_cols[0]
         if _tx_val not in _file_cols:
             st.session_state["sb_text"] = _file_cols[min(1, len(_file_cols) - 1)]
-        id_col   = st.selectbox("ID Column",           _file_cols, key="sb_id")
-        text_col = st.selectbox("Conversation Column", _file_cols, key="sb_text")
+        id_col   = st.selectbox("ID Column",           _file_cols, key="sb_id",
+                                help="Unique identifier per record (e.g. Ticket ID, Conversation Id).")
+        text_col = st.selectbox("Conversation Column", _file_cols, key="sb_text",
+                                help="Column containing raw transcript or comment text to be analysed.")
     else:
-        id_col   = st.text_input("ID Column",           value=_dcfg["id_default"],   key="sb_id")
-        text_col = st.text_input("Conversation Column", value=_dcfg["text_default"], key="sb_text")
+        id_col   = st.text_input("ID Column",           value=_dcfg["id_default"],   key="sb_id",
+                                 help="Unique identifier per record (e.g. Ticket ID, Conversation Id).")
+        text_col = st.text_input("Conversation Column", value=_dcfg["text_default"], key="sb_text",
+                                 help="Column containing raw transcript or comment text to be analysed.")
     st.divider()
 
     st.caption("VALIDATION OVERRIDE")
@@ -934,7 +938,8 @@ with st.sidebar:
 
     st.caption("OPTIONS")
     rule_threshold = st.slider("Rule confidence threshold", 0.50, 0.99, 0.70, 0.05,
-                                label_visibility="visible")
+                                label_visibility="visible",
+                                help="Rules above this confidence are accepted directly. Below it, VADER is blended in. Higher = stricter rules.")
     redact_pii = st.toggle("Redact PII in display", value=False,
                            help="Masks emails, phone numbers, SSNs and card numbers.")
 
@@ -1028,6 +1033,19 @@ if page == "Upload & Analyse":
     with st.expander("Preview (first 5 rows)"):
         st.dataframe(df_raw[[id_col, text_col]].head(5), width='stretch')
 
+    with st.expander("📖 Glossary — Upload & Analyse"):
+        st.markdown("""
+| Term | Definition |
+|---|---|
+| **ID Column** | Unique identifier for each conversation/record (e.g. Ticket ID, Conversation Id). |
+| **Conversation Column** | The raw transcript or comment text that will be analysed. |
+| **Domain** | The business context (PPT, Hilton, Netflix, Spotify, GoDaddy) — determines which extraction and classification rules apply. |
+| **Validation Override** | An Excel file with pre-labelled sentiments. These labels take highest priority and override all model predictions. Must contain an ID column and an *Actual Sentiment* column. |
+| **Rule Confidence Threshold** | Minimum confidence required for a rule-based classification to be accepted without falling back to VADER. Default 0.70. |
+| **Auto-detect** | Sentix reads a sample of the uploaded file and infers the domain and column mapping automatically. |
+""")
+
+
     validation_dict = {}
     if val_file:
         val_file.seek(0)
@@ -1103,6 +1121,19 @@ elif page == "Reports & Insights":
     k5.markdown(mc_anim("Positive",        f"{pos_n:,}", "#3D7A5F",           delay=0.20), unsafe_allow_html=True)
 
     st.divider()
+
+    with st.expander("📖 Glossary — Reports & Insights"):
+        st.markdown("""
+| Term | Definition |
+|---|---|
+| **Consumer Score** | Numeric sentiment score from −1.0 (very negative) to +1.0 (very positive). Hilton uses a −10 to +10 scale. |
+| **Consumer Sentiment** | Label derived from the score: Very Positive ≥ 0.60 · Positive ≥ 0.20 · Neutral (−0.20 to 0.20) · Negative ≤ −0.20 · Very Negative ≤ −0.60 |
+| **Confidence** | How certain the model is (0–1). High >0.70 means a rule or validation matched strongly; Low <0.30 means VADER or BERT was used with limited signal. |
+| **Validation Source** | *Validation* = label came from the uploaded override file. *Model* = label assigned by the pipeline. |
+| **Negative Keywords** | Specific phrases found in the customer text that indicate a negative signal, grouped by issue category. |
+| **Avg / Median Score** | Mean and median of all consumer scores. A shift towards negative signals emerging customer pain. |
+| **High Confidence** | Records where confidence > 0.70 — classifications the pipeline is most certain about. |
+""")
 
     tab_summary, tab_evidence = st.tabs(["Summary", "Evidence"])
 
@@ -1280,6 +1311,18 @@ elif page == "Keyword Analysis":
     if not cat_summary:
         st.info("No negative keywords found."); st.stop()
 
+    with st.expander("📖 Glossary — Keyword Analysis"):
+        st.markdown("""
+| Term | Definition |
+|---|---|
+| **Issue Category** | A named group of related negative keywords (e.g. *Payment Issues*, *Access Issues*). Each domain has its own set of categories. |
+| **Impacted Records** | Number of conversations where at least one keyword from this category was detected. |
+| **% of Dataset** | Share of total records that contain keywords from this category. |
+| **Negative Keywords** | Exact phrases extracted from customer text that match a predefined keyword list for a category. |
+| **Sentiment Mix** | Breakdown of Positive / Neutral / Negative sentiment among records that contain this category's keywords — useful to see if the issue always drives negative sentiment or sometimes resolves positively. |
+| **Sample Comments** | Up to 3 real customer excerpts from this category. Matched keywords are highlighted in red. |
+""")
+
     # ── Category overview bar chart ───────────────────────────────────────────
     ov_labels  = [cs["label"] for cs in cat_summary]
     ov_counts  = [cs["records"] for cs in cat_summary]
@@ -1434,6 +1477,22 @@ elif page == "Audit Trail":
     out                        = st.session_state.result
     id_col, text_col, _domain = _page_state(id_col, text_col, domain)
     total    = len(out)
+
+    with st.expander("📖 Glossary — Audit Trail"):
+        st.markdown("""
+| Term | Definition |
+|---|---|
+| **Triage Bucket** | How a record was classified. Filters the table to records that went through a specific path. |
+| **Validation Overrides** | Records whose sentiment was set by the uploaded validation file — not the model. |
+| **Rule-fired** | Records classified by a keyword/pattern rule (e.g. matched a negative trigger phrase). |
+| **VADER** | Records where no rule matched — scored by VADER, a lexicon-based sentiment tool. |
+| **BERT Corrections** | Records where VADER gave low confidence and DistilBERT corrected the label. |
+| **Low Confidence** | Model-scored records with confidence < 0.30 — classifications with the least certainty. |
+| **Blank / Unscored** | Empty text, very short messages, or non-English rows that could not be scored. |
+| **Method (_rule_fired)** | The exact pipeline step that produced the final label: e.g. `rule:negative`, `vader`, `bert:positive`, `validation`. |
+| **VADER Raw Score** | The unmodified compound score from VADER before any rule blending or BERT correction. |
+| **Confidence** | Final confidence of the classification (0–1). High >0.70 · Medium 0.30–0.70 · Low <0.30. |
+""")
 
     # ── Triage cards ──────────────────────────────────────────────────────────
     triage_defs = [

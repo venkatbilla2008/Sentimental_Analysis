@@ -1,52 +1,25 @@
 """
-SentimentHub — PPT Vader Adaptive
-Self-contained Streamlit app with all PPT logic embedded.
+Sentix — Multi-Domain Sentiment Analysis
 Run: streamlit run app.py
 """
 
-import html as _html_mod
+import hashlib
+import html as _html
 import io
 import re
 import time
-import unicodedata
 import warnings
-from collections import Counter
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import polars as pl
 import streamlit as st
 
+from domains import run_analysis
+from domains.shared import load_validation_data
+
 warnings.filterwarnings("ignore")
-
-# ── Optional multilingual / hybrid-model packages (Hilton domain) ─────────────
-_AFINN_OK = _TEXTBLOB_OK = _LANGDETECT_OK = _TRANSLATOR_OK = False
-try:
-    from afinn import Afinn as _Afinn
-    _af = _Afinn()
-    _AFINN_OK = True
-except ImportError:
-    pass
-
-try:
-    from textblob import TextBlob as _TextBlob
-    _TEXTBLOB_OK = True
-except ImportError:
-    pass
-
-try:
-    from langdetect import detect_langs, DetectorFactory, LangDetectException
-    DetectorFactory.seed = 0
-    _LANGDETECT_OK = True
-except ImportError:
-    pass
-
-try:
-    from deep_translator import GoogleTranslator as _GoogleTranslator
-    _TRANSLATOR_OK = True
-except ImportError:
-    pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DOMAIN REGISTRY
@@ -76,1621 +49,261 @@ DOMAIN_CONFIG = {
         "text_default": "Message Text (Translate/Original)",
         "slug":         "spotify",
     },
+    "godaddy": {
+        "label":        "GoDaddy — Domain & Hosting",
+        "id_default":   "ID",
+        "text_default": "Comments",
+        "slug":         "godaddy",
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SentimentHub — Multi-Domain",
+    page_title="Sentix",
     layout="wide",
-    page_icon="💬",
+    page_icon="🔍",
     initial_sidebar_state="expanded",
 )
 
+# Apply any pending auto-detect values BEFORE widgets are instantiated
+for _pk, _wk in [
+    ("_pending_domain", "sb_domain"),
+    ("_pending_id",     "sb_id"),
+    ("_pending_text",   "sb_text"),
+]:
+    if _pk in st.session_state:
+        st.session_state[_wk] = st.session_state.pop(_pk)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS  (teal / slate / gold palette)
+# CSS
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 :root{
   --teal:#2D5F6E; --teal-l:#3A7A8C; --slate:#6B8A99; --steel:#A8BCC8;
-  --warm:#D1CFC4; --warm-l:#E8E6DD; --gold:#D4B94E;
-  --bg:#F5F4F0; --card:#FFFFFF; --border:#D1CFC4;
-  --text:#1E2D33; --text2:#3D5A66; --muted:#6B8A99;
-  --success:#3D7A5F; --warn:#B8963E; --err:#A04040;
+  --warm:#D1CFC4; --warm-l:#F0EEE8; --gold:#D4B94E;
+  --bg:#F5F4F0; --card:#FFFFFF; --border:#E0DDD6;
+  --text:#1E2D33; --text2:#3D5A66; --muted:#7A95A2;
+  --ok:#3D7A5F; --warn:#B8963E; --err:#A04040;
 }
-.stApp { font-family:'DM Sans',sans-serif; background:var(--bg); }
-.stApp h1,.stApp h2,.stApp h3 { font-weight:600; color:var(--text); }
+html,body,[class*="css"]{ font-family:'DM Sans',sans-serif; }
+.stApp{ background:var(--bg); }
+.stApp h1,.stApp h2,.stApp h3{ font-weight:600; color:var(--text); }
 
 /* Sidebar */
-section[data-testid="stSidebar"] { background:var(--warm-l)!important; border-right:1px solid var(--warm)!important; }
-section[data-testid="stSidebar"] * { color:var(--text)!important; }
-section[data-testid="stSidebar"] .stButton>button { justify-content:flex-start!important; padding-left:16px!important; }
-section[data-testid="stSidebar"] .stButton>button[kind="primary"] { background:var(--teal)!important; color:#E8D97A!important; font-weight:600!important; }
-section[data-testid="stSidebar"] .stButton>button[kind="secondary"] { background:transparent!important; border-color:var(--warm)!important; }
-section[data-testid="stSidebar"] .stButton>button[kind="secondary"]:hover { background:var(--warm-l)!important; border-color:var(--teal)!important; }
+section[data-testid="stSidebar"]{ background:var(--warm-l)!important; border-right:1px solid var(--border)!important; }
+section[data-testid="stSidebar"] *{ color:var(--text)!important; }
+section[data-testid="stSidebar"] .stButton>button{
+  justify-content:flex-start!important; text-align:left!important;
+  padding:10px 16px!important; border-radius:8px!important; width:100%!important;
+  margin-bottom:3px!important; font-weight:500!important; font-size:13px!important;
+  background:transparent!important; border:1px solid transparent!important;
+  color:var(--text2)!important; transition:all .15s!important; }
+section[data-testid="stSidebar"] .stButton>button:hover{
+  background:var(--warm)!important; border-color:var(--teal)!important; color:var(--teal)!important; }
+section[data-testid="stSidebar"] .stButton>button[kind="primary"]{
+  background:var(--teal)!important; color:#fff!important; border-color:var(--teal)!important; font-weight:600!important; }
 
-/* Metric cards */
-.mc { background:var(--card); border:1px solid var(--border); border-radius:10px;
-      padding:18px 16px; text-align:center; border-top:3px solid var(--teal);
-      box-shadow:0 1px 4px rgba(45,95,110,.06); transition:all .2s; }
-.mc:hover { box-shadow:0 4px 16px rgba(45,95,110,.1); transform:translateY(-1px); }
-.mv { font-size:22px; font-weight:700; color:var(--text); margin:0; }
-.ml { font-size:10px; font-weight:600; color:var(--muted); margin:5px 0 0;
-      text-transform:uppercase; letter-spacing:.7px; }
+/* Animated metric card */
+@keyframes numReveal{
+  from{ opacity:0; transform:translateY(8px) scale(.94) }
+  to  { opacity:1; transform:translateY(0)   scale(1)   }
+}
+.mc-anim{
+  background:var(--card); border:1px solid var(--border); border-radius:10px;
+  padding:16px 12px; text-align:center; border-top-width:3px; border-top-style:solid; }
+.mv{ font-size:22px; font-weight:700; margin:0; line-height:1.2;
+     animation:numReveal .5s cubic-bezier(.22,1,.36,1) both; }
+.ml{ font-size:10px; font-weight:600; color:var(--muted); margin:5px 0 0;
+     text-transform:uppercase; letter-spacing:.6px; }
 
-/* Section headers */
-.sh { display:flex; align-items:center; gap:8px; margin:24px 0 12px;
-      font-size:15px; font-weight:600; color:var(--text);
-      padding-bottom:8px; border-bottom:2px solid var(--warm); }
+/* Executive banner */
+.exec-banner{
+  background:linear-gradient(135deg,#0C1A20,#162A32); border-radius:12px;
+  padding:18px 22px; margin-bottom:18px; border-left:4px solid var(--gold); }
+.exec-label{ font-size:10px; font-weight:700; color:var(--gold); letter-spacing:2px;
+  text-transform:uppercase; margin-bottom:6px; }
+.exec-text{ font-size:13px; color:#C0D8E0; line-height:1.7; }
+.exec-text strong{ color:#E4E0D8; }
+.exec-stats{ display:flex; gap:20px; flex-wrap:wrap; margin-top:10px; }
+.exec-stat{ font-size:12px; font-weight:600; color:#8BBAC8; }
+.exec-stat span{ color:#E4E0D8; }
 
-/* Badges */
-.badge { display:inline-flex; align-items:center; gap:4px; padding:4px 12px;
-         border-radius:5px; font-size:12px; font-weight:600; }
-.b-ok   { background:#D4E8DC; color:var(--success); }
-.b-warn { background:#F0E6C8; color:#7A6620; }
-.b-info { background:#D6E8EE; color:var(--teal); }
-.b-err  { background:#F2D6D6; color:var(--err); }
+/* Score bar */
+.sbar{ display:flex; align-items:center; gap:6px; }
+.sbar-t{ flex:1; height:4px; background:#E8E6DD; border-radius:999px; overflow:hidden; min-width:60px; }
+.sbar-f{ height:100%; border-radius:999px; }
 
-/* Sentiment row chips */
-.chip-vp  { background:#D4E8DC; color:#2A5C40; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-.chip-pos { background:#E8F4D4; color:#3D6B20; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-.chip-neu { background:#E8E6DD; color:#5A5A5A; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-.chip-neg { background:#F2D6D6; color:#7A2020; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
-.chip-vn  { background:#EEC4C4; color:#5A1010; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:600; }
+/* Table — lighter, less aggressive */
+.pt{ width:100%; border-collapse:collapse; font-size:12px; }
+.pt th{ background:#EFF0EC; color:var(--text2); font-weight:600; padding:8px 12px;
+        text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.4px;
+        border-bottom:2px solid var(--border); white-space:nowrap; }
+.pt td{ padding:7px 12px; border-bottom:1px solid var(--border); color:var(--text);
+        vertical-align:middle; max-width:300px; }
+.pt td.ellip{ overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pt tr:hover td{ background:#EEF4F7; }
 
-/* Buttons */
-.stButton>button[kind="primary"] { background:var(--teal)!important; border-color:var(--teal)!important; color:#FFF!important; }
-.stButton>button[kind="primary"]:hover { background:var(--teal-l)!important; }
-.stProgress>div>div>div { background:var(--teal)!important; }
-footer, .stDeployButton { display:none!important; }
+/* Sentiment chip — inline, no border */
+.chip{ display:inline-block; padding:2px 9px; border-radius:4px; font-size:11px; font-weight:600; }
+.c-vp{ background:#D4EAE0; color:#2A6048; }
+.c-p { background:#E0EDD4; color:#3A5A28; }
+.c-n { background:#E8E6DD; color:#555;    }
+.c-ng{ background:#F5E8D4; color:#7A4A1A; }
+.c-vn{ background:#F2D8D8; color:#7A2828; }
+
+/* Detail card */
+.detail-card{ background:var(--card); border:1px solid var(--border); border-radius:10px;
+  padding:18px 20px; margin-top:12px; }
+.detail-label{ font-size:10px; font-weight:700; text-transform:uppercase;
+  letter-spacing:.8px; color:var(--muted); margin-bottom:4px; }
+.detail-value{ font-size:13px; color:var(--text); line-height:1.6; }
+
+/* Pagination */
+.pg-info{ text-align:center; padding:4px 0; color:var(--muted); font-size:12px; }
+
+/* Tab */
+.stTabs [data-baseweb="tab"]{ font-weight:500; color:var(--muted); font-size:13px; }
+.stTabs [aria-selected="true"]{ color:var(--teal)!important; border-bottom-color:var(--teal)!important; font-weight:600; }
+.stButton>button[kind="primary"]{ background:var(--teal)!important; border-color:var(--teal)!important; color:#FFF!important; font-weight:600!important; }
+.stButton>button[kind="primary"]:hover{ background:var(--teal-l)!important; }
+.stProgress>div>div>div{ background:var(--teal)!important; }
+footer,.stDeployButton{ display:none!important; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════════  PPT LOGIC (from notebook)  ══════════════════════════
+# PII REDACTION
 # ─────────────────────────────────────────────────────────────────────────────
-
-# ── VADER ────────────────────────────────────────────────────────────────────
-@st.cache_resource
-def load_vader():
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    return SentimentIntensityAnalyzer()
-
-
-@st.cache_resource
-def _load_bert_optional():
-    """Load DistilBERT for borderline Spotify corrections. Returns None if unavailable."""
-    try:
-        import torch
-        from transformers import pipeline as hf_pipeline
-        device = 0 if torch.cuda.is_available() else -1
-        return hf_pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=device,
-        )
-    except Exception:
-        return None  # Transformers not installed — BERT step skipped silently
-
-
-# ── PT Content (domain terms to strip) ───────────────────────────────────────
-PT_CONTENT_SET = {
-    "professional physical therapy", "professional pt", "physical therapy",
-    "pt session", "therapy session", "treatment session",
+_PII_PATTERNS = {
+    "EMAIL": re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
+    "PHONE": re.compile(r"(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}"),
+    "SSN":   re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "CARD":  re.compile(r"\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13})\b"),
 }
 
-REMOVE_PATTERNS = [
-    r"chat with an agent", r"chat with agent", r"speak to agent",
-    r"talk to agent", r"connect me to agent", r"agent chat",
-    r"chat to agent", r"agent help", r"help chat",
-]
-REMOVE_PATTERN = re.compile("|".join(REMOVE_PATTERNS), re.IGNORECASE)
-
-
-# ── Speaker extraction ────────────────────────────────────────────────────────
-def extract_customer_messages(text):
-    """Extract customer-only messages from HTML or SMS transcript formats."""
-    if not isinstance(text, str) or not text.strip():
-        return ""
-
-    # ---- HTML format: <b>HH:MM:SS Speaker:</b> message <br/>
-    html_pattern = r'<b>(\d{2}:\d{2}:\d{2})\s+([^:]+?)\s*:\s*</b>([^<]+?)(?:<br\s*/?>|$)'
-    html_matches = re.findall(html_pattern, text, flags=re.IGNORECASE | re.DOTALL)
-
-    if html_matches:
-        speaker_messages = {}
-        for timestamp, speaker, message in html_matches:
-            spk = speaker.strip().lower()
-            if spk == "system":
-                continue
-            speaker_messages.setdefault(spk, []).append(message.strip())
-
-        if not speaker_messages:
-            return ""
-
-        speaker_counts = {s: len(m) for s, m in speaker_messages.items()}
-        if len(speaker_counts) == 1:
-            customer_name = list(speaker_counts.keys())[0]
-        else:
-            sorted_speakers = sorted(speaker_counts.items(), key=lambda x: x[1])
-            first_speaker = None
-            for _, spk, _ in html_matches:
-                if spk.strip().lower() != "system":
-                    first_speaker = spk.strip().lower()
-                    break
-            if first_speaker and speaker_counts[first_speaker] <= sorted_speakers[0][1]:
-                customer_name = first_speaker
-            else:
-                customer_name = sorted_speakers[0][0]
-
-        msgs = speaker_messages[customer_name]
-        return " ".join(re.sub(r"\s+", " ", m).strip() for m in msgs if m.strip())
-
-    # ---- SMS format: HH:MM:SS Speaker: message
-    sms_pattern = r'(\d{2}:\d{2}:\d{2})\s+([^:]+?)\s*:\s*(.+?)(?=\d{2}:\d{2}:\d{2}\s+|$)'
-    sms_matches = re.findall(sms_pattern, text, flags=re.DOTALL)
-
-    if sms_matches:
-        speaker_messages = {}
-        for timestamp, speaker, message in sms_matches:
-            spk = speaker.strip().lower()
-            if spk == "system":
-                continue
-            msg = re.sub(r'\d{4}-\d{2}-\d{2}T[\d:.]+Z\w+$', '', message)
-            msg = re.sub(r'Looks up Phone Number.*?digits-\d+', '', msg)
-            msg = re.sub(r'Looks up SSN number.*?digits-\d+', '', msg)
-            msg = re.sub(r'Phone Numbers rule for Chat', '', msg)
-            msg = re.sub(r'SSN rule for Chat', '', msg)
-            msg = msg.strip()
-            if msg:
-                speaker_messages.setdefault(spk, []).append(msg)
-
-        if not speaker_messages:
-            return ""
-
-        phone_spks = [s for s in speaker_messages if re.match(r'^\d+$', s)]
-        if phone_spks:
-            customer_name = phone_spks[0]
-        elif len(speaker_messages) == 1:
-            customer_name = list(speaker_messages.keys())[0]
-        else:
-            speaker_counts = {s: len(m) for s, m in speaker_messages.items()}
-            customer_name = sorted(speaker_counts.items(), key=lambda x: x[1])[0][0]
-
-        msgs = speaker_messages[customer_name]
-        return " ".join(re.sub(r"\s+", " ", m).strip() for m in msgs if m.strip())
-
-    return ""
-
-
-# ── Text cleaning ─────────────────────────────────────────────────────────────
-def aggressive_clean_text(text):
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    text = REMOVE_PATTERN.sub("", text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    if len(text) < 5 or len(text.split()) < 2:
-        return ""
+def _redact(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    for ptype, pat in _PII_PATTERNS.items():
+        text = pat.sub(f"[{ptype}]", text)
     return text
 
 
-def remove_pt_content_names(text):
-    if not isinstance(text, str) or not text.strip():
-        return text
-    text_lower = text.lower()
-    cleaned = text
-    for content in PT_CONTENT_SET:
-        if content in text_lower:
-            cleaned = re.compile(re.escape(content), re.IGNORECASE).sub("", cleaned)
-    return re.sub(r'\s+', ' ', cleaned).strip()
-
-
-# ── Negative keyword dictionary ───────────────────────────────────────────────
-NEGATIVE_KEYWORDS = {
-    "payment_issues": [
-        "money is debited", "money was debited", "money was withdrawn",
-        "charged double", "being charged double", "double charged",
-        "unauthorized charge", "charged without permission",
-        "payment not going through", "unable to do payment",
-        "payment is pending", "payment failed", "payment issue",
-        "billing issue", "billing problem", "wrong amount charged",
-        "overcharged", "charged incorrectly", "incorrect charge",
-        "refund not received", "still waiting for refund",
-    ],
-    "access_issues": [
-        "cannot access", "cant access", "can't access", "unable to access",
-        "not working properly", "doesn't work", "does not work",
-        "not working", "stopped working", "no longer works",
-        "hacked my account", "account hacked", "compromised account",
-        "locked out", "account locked", "suspended account",
-        "login issue", "login problem", "can't login", "cannot login",
-        "portal not working", "website down", "app not working",
-    ],
-    "delivery_issues": [
-        "still have not received", "have not received", "not received",
-        "did not receive", "never received", "haven't received",
-        "waiting for", "still waiting", "no response",
-        "not delivered", "delivery failed", "never got",
-    ],
-    "unwanted_actions": [
-        "without my permission", "without permission", "without consent",
-        "i do not want this", "did not want to renew",
-        "did not want to restart", "didn't want to renew",
-        "auto renewed", "automatically renewed", "renewed without asking",
-        "charged after cancellation", "cancelled but charged",
-        "didn't authorize", "unauthorized",
-    ],
-    "technical_issues": [
-        "notifications are getting stuck", "getting stuck", "stuck",
-        "error message", "error occurred", "system error",
-        "technical issue", "technical problem", "glitch",
-        "buffering issue", "streaming problem", "won't load",
-        "keeps crashing", "app crashes", "freezing",
-        "not loading", "page not loading",
-    ],
-    "frustration": [
-        "frustrating", "frustrated", "annoyed", "angry",
-        "disappointed", "upset", "irritated", "furious",
-        "unacceptable", "ridiculous", "terrible", "horrible",
-        "worst", "pathetic", "useless", "awful",
-        "disgusted", "fed up", "sick of", "tired of",
-        "not happy", "unhappy", "dissatisfied",
-    ],
-    "poor_service": [
-        "thanks for nothing", "no help", "not helpful", "unhelpful",
-        "you dont want to help", "you don't want to help",
-        "waste of time", "wasting my time", "poor service",
-        "bad service", "terrible service", "worst service",
-        "no support", "poor support", "terrible support",
-        "unprofessional", "rude", "disrespectful",
-    ],
-    "resolution_issues": [
-        "not resolved", "still not resolved", "unresolved",
-        "no solution", "not fixed", "still broken",
-        "problem persists", "issue continues", "still having issues",
-        "unforeseen circumstances", "unexpected problem",
-        "still experiencing", "ongoing issue",
-    ],
-    "appointment_issues": [
-        "missed appointment", "late appointment", "wrong appointment",
-        "appointment not scheduled", "double booked", "no appointment available",
-        "long wait time", "waiting too long", "waited forever",
-        "no show", "didn't show up", "never showed",
-        "cancelled my appointment", "appointment was cancelled",
-        "rescheduled without notice", "changed without telling me",
-        "therapist didn't show", "no therapist available",
-        "running late", "always late", "never on time",
-    ],
-    "treatment_issues": [
-        "treatment didn't work", "no improvement", "getting worse",
-        "pain increased", "not getting better", "ineffective treatment",
-        "wrong diagnosis", "misdiagnosed", "incorrect treatment",
-        "not helping", "doesn't help", "no progress",
-        "condition worsened", "more pain", "hurts more",
-    ],
-    "communication_issues": [
-        "no response", "didn't respond", "no callback", "never called back",
-        "ignored my request", "no follow up", "poor communication",
-        "never heard back", "no one contacted me",
-        "didn't call me back", "no one called", "unreachable",
-        "can't reach anyone", "no answer", "not responding",
-    ],
-    "staff_issues": [
-        "rude staff", "unprofessional staff", "incompetent",
-        "didn't listen", "ignored me", "dismissive",
-        "not trained", "inexperienced", "careless",
-        "rushed through", "didn't care", "indifferent",
-    ],
-    "billing_insurance": [
-        "insurance not accepted", "insurance issue", "insurance problem",
-        "claim denied", "not covered", "out of network",
-        "surprise bill", "unexpected charge", "hidden fee",
-        "wrong insurance", "billing error",
-    ],
-    "general_negative": [
-        "problem", "issue", "concern", "complaint",
-        "trouble", "difficulty", "struggle",
-        "wrong", "incorrect", "mistake", "error",
-        "broken", "damaged", "defective",
-        "lost", "missing", "disappeared",
-        "failed", "failure", "unsuccessful",
-    ],
-}
-
-ALL_NEGATIVE_KEYWORDS_SORTED = sorted(
-    [kw for kws in NEGATIVE_KEYWORDS.values() for kw in kws],
-    key=len, reverse=True
-)
-negative_keyword_pattern = re.compile(
-    "|".join(re.escape(k) for k in ALL_NEGATIVE_KEYWORDS_SORTED),
-    re.IGNORECASE
-)
-
-
-# ── Sentiment trigger patterns ────────────────────────────────────────────────
-VERY_NEGATIVE_TRIGGERS = [
-    "worst experience", "absolutely terrible", "completely unacceptable",
-    "never coming back", "will never use again", "horrible experience",
-    "disgusted", "furious", "outraged",
-    "scam", "fraud", "stealing my money",
-    "sue", "lawyer", "legal action",
-    "file a complaint", "report to", "better business bureau",
-]
-NEGATIVE_TRIGGERS = [
-    "still have not received", "have not received", "not received",
-    "money is debited", "money was debited", "money was withdrawn",
-    "without my permission", "without permission", "without consent",
-    "i do not want this", "did not want to renew",
-    "thanks for nothing",
-    "getting stuck", "notifications are getting stuck",
-    "unable to do payment", "payment is pending", "payment failed",
-    "frustrating", "frustrated", "annoyed", "angry", "upset",
-    "disappointed", "terrible", "horrible", "worst",
-    "unacceptable", "ridiculous", "pathetic", "useless",
-    "not working properly", "doesn't work", "cant access", "cannot access",
-    "not working", "stopped working",
-    "hacked my account", "compromised account",
-    "charged double", "overcharged", "incorrect charge",
-    "unforeseen circumstances",
-    "you dont want to help", "you don't want to help",
-    "no help", "not helpful", "unhelpful",
-    "waste of time", "wasting my time",
-    "long wait", "waiting too long", "waited forever",
-    "no improvement", "getting worse", "pain increased",
-    "treatment didn't work", "not getting better",
-    "no show", "didn't show up", "never showed",
-    "rude", "unprofessional", "dismissive",
-    "no response", "never called back", "ignored",
-    "not resolved", "still not resolved", "problem persists",
-]
-NEUTRAL_TRIGGERS = [
-    "cancel appointment", "reschedule", "change appointment",
-    "need to cancel", "please cancel", "want to cancel",
-    "want to reschedule", "need to reschedule",
-    "move my appointment", "change my appointment time",
-    "change email", "change my email", "update email",
-    "change the email address", "need to change my email",
-    "change my card", "change card details", "update payment",
-    "remove payment method", "update my information",
-    "verify my account", "need to update",
-    "want my refund", "please refund", "need a refund",
-    "issue a refund", "can you refund", "requesting refund",
-    "how to", "how can i", "how do i",
-    "can you help", "need help", "help me",
-    "can i get", "is there any", "is it possible",
-    "questions about", "just wondering",
-    "what is", "where can i", "when will",
-    "change plan", "switch plan", "upgrade", "downgrade",
-    "change from", "switch to",
-    "just canceled", "just cancelled",
-    "finding current password", "reset password",
-    "need to add", "want to add",
-]
-POSITIVE_TRIGGERS = [
-    "thank you", "thanks", "thank u", "ty",
-    "appreciate", "grateful", "thankful",
-    "perfect", "great", "excellent", "awesome",
-    "helpful", "very helpful", "super helpful",
-    "wonderful", "fantastic", "amazing",
-    "thanks for the quick reply", "thanks for your help",
-    "appreciate you looking into", "appreciate your help",
-    "thanks for clarifying", "thanks for explaining",
-    "that works", "sounds good", "that's fine",
-    "all set", "all good", "we're good",
-]
-VERY_POSITIVE_TRIGGERS = [
-    "outstanding", "exceeded expectations",
-    "extremely helpful", "incredibly helpful",
-    "absolutely perfect", "best service",
-    "highly recommend", "couldn't be better",
-    "amazing service", "excellent service",
-    "love it", "love this", "absolutely love",
-]
-
-# Compile all trigger patterns once
-very_neg_pattern  = re.compile("|".join(re.escape(p) for p in VERY_NEGATIVE_TRIGGERS),  re.IGNORECASE)
-neg_pattern       = re.compile("|".join(re.escape(p) for p in NEGATIVE_TRIGGERS),        re.IGNORECASE)
-neutral_pattern   = re.compile("|".join(re.escape(p) for p in NEUTRAL_TRIGGERS),          re.IGNORECASE)
-positive_pattern  = re.compile("|".join(re.escape(p) for p in POSITIVE_TRIGGERS),         re.IGNORECASE)
-very_pos_pattern  = re.compile("|".join(re.escape(p) for p in VERY_POSITIVE_TRIGGERS),    re.IGNORECASE)
-
-STRONG_NEGATIVE_PHRASES = [
-    "without my permission", "without permission",
-    "do not want this", "did not want",
-    "thanks for nothing",
-    "unable to do payment", "payment failed",
-    "still have not received", "never received",
-    "long wait", "waiting too long", "waited forever",
-    "no improvement", "getting worse", "pain increased",
-    "treatment didn't work",
-    "no show", "didn't show up",
-    "rude", "unprofessional", "dismissive",
-    "waste of time", "wasting my time",
-    "not helpful", "no help",
-    "not resolved", "problem persists",
-]
-
-
-# ── Context helpers ───────────────────────────────────────────────────────────
-def has_resolution_or_thanks(text):
-    tl = text.lower()
-    indicators = ["thanks","thank you","thank u","ty","okay","ok","ok thanks","perfect",
-                  "got it","understood","appreciate","that will be all","sounds good",
-                  "that works","all set","all good","we're good"]
-    return any(i in tl for i in indicators)
-
-def is_polite_request(text):
-    tl = text.lower()
-    polite = ["please","can you","could you","would you","i want to","i need to",
-              "i would like","help me","can i","may i","how to","how can","how do i"]
-    frustration = ["frustrated","angry","annoyed","furious","terrible","horrible",
-                   "worst","pathetic","useless","awful","unacceptable","ridiculous"]
-    return any(p in tl for p in polite) and not any(f in tl for f in frustration)
-
-def has_simple_cancellation(text):
-    tl = text.lower()
-    simple = ["cancel my appointment","cancel appointment","need to cancel",
-              "want to cancel","please cancel","can i cancel","reschedule"]
-    complaint = ["frustrated","angry","terrible","horrible","long wait",
-                 "no show","late","problem","issue","complaint"]
-    return any(s in tl for s in simple) and not any(c in tl for c in complaint)
-
-
-# ── Rule-based classification (direct from notebook) ─────────────────────────
-def classify_by_rules(text):
-    if not isinstance(text, str) or not text.strip():
-        return 0.0, 0.0
-
-    tl = text.lower()
-
-    if very_neg_pattern.search(text):
-        return -0.85, 0.95
-
-    if very_pos_pattern.search(text):
-        return 0.85, 0.95
-
-    if positive_pattern.search(text):
-        pos_count = len(re.findall(
-            r'\b(thank|thanks|appreciate|perfect|helpful|great|excellent|awesome)\b', tl))
-        return (0.75, 0.90) if pos_count >= 2 else (0.35, 0.80)
-
-    if neg_pattern.search(text):
-        if has_resolution_or_thanks(text):
-            neg_matches = len(neg_pattern.findall(text))
-            if neg_matches == 1 and any(w in tl[-100:] for w in ["thank","thanks","appreciate"]):
-                return 0.0, 0.75
-        if any(phrase in tl for phrase in STRONG_NEGATIVE_PHRASES):
-            return -0.70, 0.95
-        return -0.55, 0.80
-
-    if neutral_pattern.search(text):
-        if has_simple_cancellation(text):
-            return 0.0, 0.90
-        if is_polite_request(text):
-            return 0.0, 0.90
-        if "refund" in tl and any(p in tl for p in ["please","want","can you","need","request"]):
-            return 0.0, 0.85
-        return 0.0, 0.80
-
-    return None, 0.0
-
-
-# ── Sentiment label from score ────────────────────────────────────────────────
-def classify_sentiment(score):
-    if pd.isna(score):
-        return "Neutral"
-    if score >= 0.60:   return "Very Positive"
-    if score >= 0.20:   return "Positive"
-    if score > -0.20:   return "Neutral"   # exclusive (matches Spotify notebook)
-    if score > -0.60:   return "Negative"
-    return "Very Negative"
-
-
-# ── VADER chunked scoring ─────────────────────────────────────────────────────
-def get_vader_compound(text, analyzer):
-    if not isinstance(text, str) or not text.strip():
-        return 0.0
-    sentences = re.split(r'(?<=[.!?]) +', text)
-    chunks, cur = [], ""
-    for s in sentences:
-        if len(cur) + len(s) <= 300:
-            cur += " " + s
-        else:
-            if cur: chunks.append(cur.strip())
-            cur = s
-    if cur: chunks.append(cur.strip())
-    if not chunks: return 0.0
-    return float(np.mean([analyzer.polarity_scores(c)['compound'] for c in chunks]))
-
-
-# ── Negative keyword extraction ───────────────────────────────────────────────
-def extract_negative_keywords(text):
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    matches = negative_keyword_pattern.findall(text)
-    if not matches:
-        return ""
-    seen, found = set(), []
-    for m in matches:
-        ml = m.lower()
-        if ml not in seen:
-            seen.add(ml)
-            found.append(m)
-    return "; ".join(found)
-
-
-# ── Validation data loader ────────────────────────────────────────────────────
-def load_validation_data(uploaded_file):
-    validation_dict = {}
-    if uploaded_file is None:
-        return validation_dict
-    try:
-        df_val = pd.read_excel(io.BytesIO(uploaded_file.read()))
-        id_col = None
-        for col in df_val.columns:
-            if col.strip().upper() in ['ID', 'PPTLEADS_COMM_ID', 'TICKET ID', 'TICKET_ID']:
-                id_col = col
-                break
-        sent_col = None
-        for col in df_val.columns:
-            if col.lower().strip() == 'actual sentiment':
-                sent_col = col
-                break
-        if not id_col or not sent_col:
-            st.warning(f"⚠️ Validation file columns not matched. Found: {df_val.columns.tolist()}")
-            return validation_dict
-        for _, row in df_val.iterrows():
-            tid = row.get(id_col)
-            snt = row.get(sent_col)
-            if pd.isna(tid) or pd.isna(snt) or not str(snt).strip():
-                continue
-            validation_dict[str(tid).strip().replace(" ", "")] = str(snt).strip()
-        return validation_dict
-    except Exception as e:
-        st.warning(f"Could not load validation file: {e}")
-        return {}
-
-
-# ── Core processing function ──────────────────────────────────────────────────
-SENTIMENT_TO_SCORE = {
-    "Very Positive": 0.85, "Positive": 0.35,
-    "Neutral": 0.0, "Negative": -0.55, "Very Negative": -0.85,
-}
-
-def run_ppt_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    analyzer = load_vader()
-    df = df.copy()
-
-    # Normalize IDs
-    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
-
-    # Extract + clean customer text
-    df["CustomerOnly"] = df[text_col].apply(extract_customer_messages)
-    df["CustomerOnly_Cleaned"] = df["CustomerOnly"].apply(aggressive_clean_text)
-    df["CustomerOnly_Cleaned"] = df["CustomerOnly_Cleaned"].apply(remove_pt_content_names)
-    df["Text_For_Analysis"] = df["CustomerOnly_Cleaned"]
-
-    n = len(df)
-    compounds, confidences, sentiments, sources = [], [], [], []
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        if progress_cb and i % max(1, n // 100) == 0:
-            progress_cb(i, n)
-
-        norm_id = row["_id_norm"]
-        text = row["Text_For_Analysis"]
-
-        # Priority 1 — validation override
-        if norm_id in validation_dict:
-            label = validation_dict[norm_id]
-            score = SENTIMENT_TO_SCORE.get(label, 0.0)
-            compounds.append(score)
-            confidences.append(1.0)
-            sentiments.append(label)
-            sources.append("Validation")
-            continue
-
-        sources.append("Model")
-
-        # Empty text
-        if not isinstance(text, str) or not text.strip():
-            compounds.append(0.0)
-            confidences.append(0.0)
-            sentiments.append("Neutral")
-            continue
-
-        # Priority 2 — rule-based
-        rule_score, confidence = classify_by_rules(text)
-
-        if rule_score is not None and confidence > 0.7:
-            compounds.append(round(rule_score, 3))
-            confidences.append(confidence)
-            sentiments.append(classify_sentiment(rule_score))
-        else:
-            # Priority 3 — VADER
-            vader_score = get_vader_compound(text, analyzer)
-            if abs(vader_score) < 0.05:
-                vader_score = 0.0
-            if rule_score is not None:
-                final = (rule_score * confidence) + (vader_score * (1 - confidence))
-            else:
-                final = vader_score
-            compounds.append(round(final, 3))
-            confidences.append(0.5)
-            sentiments.append(classify_sentiment(final))
-
-    if progress_cb:
-        progress_cb(n, n)
-
-    df["consumer_score"]     = compounds
-    df["confidence"]         = confidences
-    df["consumer_sentiment"] = sentiments
-    df["validation_source"]  = sources
-
-    # Negative keyword extraction
-    df["Negative_Keywords"] = df["Text_For_Analysis"].apply(extract_negative_keywords)
-
-    return df
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════  HILTON (TRAVEL) DOMAIN LOGIC  ═══════════════════════════
+# AUTO-DETECT FORMAT
 # ─────────────────────────────────────────────────────────────────────────────
+_FMT_NETFLIX  = re.compile(r'\[\d{2}:\d{2}:\d{2}\s+(CUSTOMER|AGENT|CONSUMER)\]:', re.I)
+_FMT_SPOTIFY  = re.compile(r'(?:\|\s*)?\d{4}-\d{2}-\d{2}.*?Consumer:', re.I | re.DOTALL)
+_FMT_SPOTIFY2 = re.compile(r'Consumer:', re.I)
+_FMT_PPT_HTML = re.compile(r'<b>\d{2}:\d{2}:\d{2}', re.I)
+_FMT_PPT_SMS  = re.compile(r'\d{2}:\d{2}:\d{2}\s+\w[\w ]+\s*:\s+\w')
 
-# ── Hilton keyword dictionaries ───────────────────────────────────────────────
-HILTON_KEYWORDS = {
-    "very_negative": [
-        "bad", "poor", "terrible", "awful", "worst", "horrible", "pathetic",
-        "disappointing", "useless", "waste", "boring", "dull", "confusing",
-        "frustrating", "annoying", "unpleasant", "uncomfortable", "disgusting",
-        "hate", "hated", "disaster", "nightmare", "rubbish", "garbage",
-    ],
-    "moderate_negative": [
-        "cold", "asleep", "feeling asleep", "sleepy", "tired", "exhausting",
-        "no equipment", "no tools", "lack of", "missing", "insufficient",
-        "had to write", "cramped", "difficult", "challenging",
-        "issue", "problem", "concern",
-    ],
-    "negative_phrases": [
-        "room was cold", "cold room", "cold board room", "feeling asleep",
-        "no equipment", "had to write everything", "lack of equipment",
-        "waste of time", "complete waste", "not worth", "didn't help",
-    ],
-    "very_positive": [
-        "excellent", "amazing", "outstanding", "brilliant", "superb",
-        "fantastic", "awesome", "wonderful", "perfect", "exceptional",
-        "mind blowing", "mind-blowing", "loved it", "absolutely love",
-    ],
-    "positive": [
-        "very good", "engaging", "all good", "good going", "overall nice",
-        "good", "interactive", "service", "experience", "product",
-        "overall good", "everything good", "informative", "helpful", "great",
-        "impressive", "valuable", "useful", "beneficial", "effective",
-        "satisfactory", "satisfied", "pleased", "happy", "enjoy", "enjoyed",
-        "nice session", "informative session", "good session", "great session",
-        "well organized", "well done", "keep it up", "thank you", "thanks",
-        "appreciate", "friendly", "professional", "approachable", "fun",
-        "insightful", "cool", "looking forward", "excited", "like", "liked",
-    ],
-    "neutral_phrases": [
-        "nothing else", "no additional comments", "no comments", "nothing",
-        "nothing to add", "no comment", "none so far", "no other comment",
-        "nothing more", "no more comments", "nothing specific",
-        "nothing in particular", "okay", "fine",
-    ],
-    "meaningless_patterns": [
-        r"^[a-zA-Z]$", r"^[0-9]+$",
-        r"^(na|n/a|n\.a|n\|a|n\\a|n\?a|ma|n\./a|n-a)$",
-        r"^(nil|none|non|nope)$",
-        r"^(ok|okay|yes|no|y|n)$",
-        r"^[^\w\s]+$",
-        r"^(.)\1+$",
-    ],
-}
+_ID_CANDIDATES = [
+    "Conversation Id", "Conversation ID", "conversation_id",
+    "CS Ticket ID", "Ticket ID", "ID", "Id", "id",
+]
 
-# Flat negative dict for Keyword Analysis page (mirrors PPT structure)
-HILTON_NEGATIVE_KEYWORDS = {
-    "very_negative":     HILTON_KEYWORDS["very_negative"],
-    "moderate_negative": HILTON_KEYWORDS["moderate_negative"],
-    "negative_phrases":  HILTON_KEYWORDS["negative_phrases"],
-}
+def _detect_domain(df: pd.DataFrame):
+    text_col, max_len = None, 0
+    for col in df.columns:
+        if df[col].dtype == object:
+            avg = df[col].dropna().astype(str).str.len().mean()
+            if avg and avg > max_len:
+                max_len, text_col = avg, col
+    if text_col is None or max_len < 15:
+        return None
 
-HILTON_KEYWORD_SCORES = {
-    "very_negative":     -9.0,
-    "moderate_negative": -5.0,
-    "negative_phrases":  -7.0,
-    "very_positive":      9.0,
-    "positive":           7.0,
-    "neutral_phrases":    0.0,
-}
+    non_null = df[text_col].dropna().astype(str)
+    indices  = np.linspace(0, len(non_null) - 1, min(8, len(non_null)), dtype=int)
+    sample   = " ".join(non_null.iloc[i] for i in indices)
 
-HILTON_SENTIMENT_THRESHOLDS = {
-    "very_positive":  5,
-    "positive":       1,
-    "neutral_low":   -2,
-    "negative":      -3,
-}
-
-# Compiled constants
-_URL_RE           = re.compile(r"https?://\S+|www\.\S+")
-_EMAIL_RE         = re.compile(r"\S+@\S+\.\S+")
-_HTML_TAG_RE      = re.compile(r"<[^>]+>")
-_MULTI_WS_RE      = re.compile(r"\s+")
-_REPEATED_PUNCT   = re.compile(r"([!?.,])\1{1,}")
-_NON_PRINTABLE_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_EMOJI_RE         = re.compile(
-    "["
-    "\U0001F300-\U0001F6FF"
-    "\U0001F900-\U0001F9FF"
-    "\U0001F1E0-\U0001F1FF"
-    "\U00002700-\U000027BF"
-    "]+", flags=re.UNICODE
-)
-
-
-def hilton_clean_text(raw):
-    """Enhanced text cleaning for Hilton domain (URL, HTML, encoding normalisation)."""
-    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
-        return ""
-    s = str(raw).strip()
-    # Fix common encoding artefacts
-    s = s.replace("Ã±", "ñ").replace("Ã¡", "á").replace("Ã©", "é")
-    s = s.replace("Ã­", "í").replace("Ã³", "ó").replace("Ãº", "ú")
-    s = _html_mod.unescape(s)
-    s = unicodedata.normalize("NFKC", s)
-    s = _URL_RE.sub(" ", s)
-    s = _EMAIL_RE.sub(" ", s)
-    s = _HTML_TAG_RE.sub(" ", s)
-    s = _NON_PRINTABLE_RE.sub(" ", s)
-    s = _REPEATED_PUNCT.sub(lambda m: m.group(1), s)
-    s = _MULTI_WS_RE.sub(" ", s).strip()
-    s = re.sub(r"^[^\w']+|[^\w']+$", "", s)
-    return s.strip()
-
-
-def hilton_is_meaningless(text):
-    """Detect NA/nil/empty/repeated-word/mostly-numeric text. Returns (bool, reason)."""
-    if not text or not text.strip():
-        return True, "empty"
-    t_lower = text.strip().lower()
-    t_norm = re.sub(r"[/\\|.\-?_ ]", "", t_lower)
-    if t_norm in {"na", "ma", "nil", "none", "non", "ok", "yes", "no"}:
-        return True, f"normalised={t_norm}"
-    for pat in HILTON_KEYWORDS["meaningless_patterns"]:
-        if re.match(pat, t_lower, re.IGNORECASE):
-            return True, f"pattern={pat}"
-    if len(text) == 1 and text.lower() not in ("i", "a"):
-        return True, "single_char"
-    if not any(c.isalnum() for c in text):
-        return True, "no_alnum"
-    words = re.findall(r"\b[a-zA-Z]+\b", text)
-    if not words:
-        return True, "no_words"
-    if len(words) > 1 and len(set(words)) == 1:
-        return True, "repeated_word"
-    num_count = sum(c.isdigit() for c in text)
-    if len(text) > 0 and num_count / len(text) > 0.5:
-        return True, "mostly_numbers"
-    return False, "ok"
-
-
-_SPANISH_INDICATORS = {
-    "tengo", "nada", "mas", "que", "agregar", "muy", "esta", "dia",
-    "gracias", "como", "mejorar", "estoy", "trabajo", "comentarios",
-}
-_ENGLISH_INDICATORS = {
-    "the", "is", "are", "was", "were", "have", "has", "had", "will",
-    "i", "you", "he", "she", "it", "we", "they", "not", "all",
-}
-
-
-def hilton_detect_language(text):
-    """Returns (lang_code, confidence). Falls back to 'en' if langdetect not available."""
-    if not text or len(text) < 3:
-        return "en", 1.0
-    t_lower = text.lower()
-    words = set(re.findall(r"\b\w+\b", t_lower))
-    spanish_chars = any(c in text for c in "áéíóúñüÃ")
-    if spanish_chars or len(words & _SPANISH_INDICATORS) >= 2:
-        return "es", 0.95
-    if len(words & _ENGLISH_INDICATORS) >= 3:
-        return "en", 0.99
-    if not _LANGDETECT_OK:
-        return "en", 0.80
-    try:
-        probs = detect_langs(text)
-        top = probs[0]
-        return top.lang, top.prob
-    except Exception:
-        return "unknown", 0.0
-
-
-_TRANSLATION_CONFIDENCE_THRESHOLD = 0.7
-_MIN_TRANSLATION_LENGTH = 3
-
-
-def hilton_smart_translate(text, lang_code, confidence):
-    """Translate to English if needed. Returns (translated_text, was_translated)."""
-    if lang_code == "en":
-        return text, False
-    if not _TRANSLATOR_OK:
-        return text, False
-    if lang_code in ("es", "fr", "pt", "it"):
-        if confidence < 0.5:
-            return text, False
+    if _FMT_NETFLIX.search(sample):
+        domain = "netflix"
+    elif _FMT_SPOTIFY.search(sample) or ("|" in sample and _FMT_SPOTIFY2.search(sample)):
+        domain = "spotify"
+    elif _FMT_PPT_HTML.search(sample) or _FMT_PPT_SMS.search(sample):
+        domain = "ppt"
     else:
-        if confidence < _TRANSLATION_CONFIDENCE_THRESHOLD:
-            return text, False
-    if len(text) < _MIN_TRANSLATION_LENGTH:
-        return text, False
-    try:
-        translated = _GoogleTranslator(source="auto", target="en").translate(text)
-        return translated, True
-    except Exception:
-        return text, False
+        domain = "hilton"
 
+    id_col = next((c for c in _ID_CANDIDATES if c in df.columns), None)
+    if id_col is None:
+        n = max(len(df), 1)
+        for col in df.columns:
+            if col != text_col:
+                try:
+                    if df[col].nunique() / n >= 0.5:
+                        id_col = col
+                        break
+                except Exception:
+                    pass
+    if id_col is None:
+        return None
 
-def _hilton_has_positive_override(text):
-    t = text.lower().strip()
-    patterns = [
-        r"nothing.*(?:happy|good|great|excellent|awesome|perfect|love|amazing)",
-        r"no.*(?:complain|issue|problem).*(?:good|great|excellent)",
-    ]
-    return any(re.search(p, t) for p in patterns)
-
-
-def _hilton_keyword_score(text):
-    """Returns (score, total_matches) on -10…+10 scale."""
-    if not text:
-        return 0.0, 0
-    t_lower = text.lower().strip()
-    score, total = 0.0, 0
-    for cat, words in [
-        ("very_positive",     HILTON_KEYWORDS["very_positive"]),
-        ("positive",          HILTON_KEYWORDS["positive"]),
-        ("neutral_phrases",   HILTON_KEYWORDS["neutral_phrases"]),
-        ("negative_phrases",  HILTON_KEYWORDS["negative_phrases"]),
-        ("very_negative",     HILTON_KEYWORDS["very_negative"]),
-        ("moderate_negative", HILTON_KEYWORDS["moderate_negative"]),
-    ]:
-        for kw in words:
-            if kw.lower() in t_lower:
-                score += HILTON_KEYWORD_SCORES[cat]
-                total += 1
-    if _hilton_has_positive_override(text):
-        score += 6.0
-        total += 1
-    if total > 0:
-        score /= total
-    return score, total
-
-
-def _hilton_hybrid_score(text):
-    """VADER(40%) + AFINN(20%) + TextBlob(20%) + Keywords(20%), adaptive weights.
-    Returns (score_-10_to_+10, confidence, method_scores_dict)."""
-    if not text or not text.strip():
-        return 0.0, 0.0, {}
-
-    method_scores = {}
-    analyzer = load_vader()
-
-    # VADER
-    try:
-        vs = analyzer.polarity_scores(text)
-        vader_scaled = vs["compound"] * 10
-        vader_conf = max(vs["pos"], vs["neg"], vs["neu"])
-    except Exception:
-        vader_scaled, vader_conf = 0.0, 0.0
-    method_scores["vader"] = vader_scaled
-
-    # AFINN
-    if _AFINN_OK:
-        try:
-            afinn_scaled = max(-10.0, min(10.0, _af.score(text) * 2.0))
-        except Exception:
-            afinn_scaled = 0.0
-    else:
-        afinn_scaled = vader_scaled * 0.5   # rough fallback
-    method_scores["afinn"] = afinn_scaled
-
-    # TextBlob
-    if _TEXTBLOB_OK:
-        try:
-            tb_scaled = _TextBlob(text).sentiment.polarity * 10
-        except Exception:
-            tb_scaled = 0.0
-    else:
-        tb_scaled = vader_scaled * 0.5
-    method_scores["textblob"] = tb_scaled
-
-    # Keywords
-    kw_score, kw_total = _hilton_keyword_score(text)
-    method_scores["keywords"] = kw_score
-
-    # Adaptive weights
-    n_words = len(text.split())
-    has_caps = any(c.isupper() for c in text)
-    has_excl = "!" in text
-    has_emoji = bool(_EMOJI_RE.search(text))
-
-    w = {"vader": 0.40, "afinn": 0.20, "textblob": 0.20, "keywords": 0.20}
-    if has_caps or has_excl or has_emoji:
-        w["vader"] += 0.15; w["textblob"] -= 0.05; w["afinn"] -= 0.05; w["keywords"] -= 0.05
-    if kw_total >= 3:
-        w["keywords"] += 0.15; w["vader"] -= 0.05; w["afinn"] -= 0.05; w["textblob"] -= 0.05
-    elif kw_total >= 1:
-        w["keywords"] += 0.10; w["vader"] -= 0.05; w["afinn"] -= 0.025; w["textblob"] -= 0.025
-    if n_words <= 5:
-        w["keywords"] += 0.10; w["afinn"] += 0.05; w["vader"] -= 0.10; w["textblob"] -= 0.05
-    if n_words > 20:
-        w["vader"] += 0.10; w["textblob"] += 0.05; w["keywords"] -= 0.10; w["afinn"] -= 0.05
-    total_w = sum(w.values())
-    w = {k: v / total_w for k, v in w.items()}
-
-    combined = max(-10.0, min(10.0,
-        w["vader"]    * vader_scaled +
-        w["afinn"]    * afinn_scaled +
-        w["textblob"] * tb_scaled    +
-        w["keywords"] * kw_score
-    ))
-
-    # Confidence
-    scores = [vader_scaled, afinn_scaled, tb_scaled, kw_score]
-    nz = [s for s in scores if abs(s) > 0.1]
-    agree_conf = max(0.0, 1.0 - (np.std(nz) / 10.0)) if len(nz) >= 2 else 0.5
-    conf = vader_conf * 0.6 + agree_conf * 0.4
-    if kw_total >= 2:
-        conf = min(1.0, conf + 0.15)
-    conf = max(0.3, min(0.95, conf))
-
-    return combined, conf, method_scores
-
-
-def classify_sentiment_hilton(score):
-    """Map -10…+10 score to 5-class label (matching PPT label names for UI consistency)."""
-    if pd.isna(score):
-        return "Neutral"
-    if score >= HILTON_SENTIMENT_THRESHOLDS["very_positive"]:
-        return "Very Positive"
-    if score >= HILTON_SENTIMENT_THRESHOLDS["positive"]:
-        return "Positive"
-    if score >= HILTON_SENTIMENT_THRESHOLDS["neutral_low"]:
-        return "Neutral"
-    if score >= HILTON_SENTIMENT_THRESHOLDS["negative"]:
-        return "Negative"
-    return "Very Negative"
-
-
-def _extract_hilton_negative_keywords(text):
-    """Extract negative keyword matches for Hilton domain."""
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    t_lower = text.lower()
-    found, seen = [], set()
-    all_kws = sorted(
-        [kw for kws in HILTON_NEGATIVE_KEYWORDS.values() for kw in kws],
-        key=len, reverse=True
-    )
-    for kw in all_kws:
-        if kw.lower() in t_lower and kw.lower() not in seen:
-            seen.add(kw.lower())
-            found.append(kw)
-    return "; ".join(found)
-
-
-def run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    """Full Hilton domain pipeline: clean → meaningless-filter → lang-detect → translate → hybrid score."""
-    analyzer_missing = []
-    if not _AFINN_OK:      analyzer_missing.append("afinn")
-    if not _TEXTBLOB_OK:   analyzer_missing.append("textblob")
-    if not _LANGDETECT_OK: analyzer_missing.append("langdetect")
-    if not _TRANSLATOR_OK: analyzer_missing.append("deep-translator")
-    if analyzer_missing:
-        st.info(f"ℹ️ Optional packages not found: `{', '.join(analyzer_missing)}` — running with available engines only.")
-
-    df = df.copy()
-    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
-    df["Cleaned_Comments"] = df[text_col].apply(hilton_clean_text)
-
-    n = len(df)
-    compounds, confidences, sentiments, sources, translated_texts, methods_log = [], [], [], [], [], []
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        if progress_cb and i % max(1, n // 100) == 0:
-            progress_cb(i, n)
-
-        norm_id = row["_id_norm"]
-        cleaned = row["Cleaned_Comments"]
-
-        # Validation override
-        if norm_id in validation_dict:
-            label = validation_dict[norm_id]
-            score = SENTIMENT_TO_SCORE.get(label, 0.0)
-            # Re-scale to -10…+10 for Hilton; keep raw labels
-            compounds.append(score * 10)
-            confidences.append(1.0)
-            sentiments.append(label)
-            sources.append("Validation")
-            translated_texts.append("")
-            methods_log.append("validation")
-            continue
-
-        sources.append("Model")
-
-        # Meaningless check
-        is_mless, _ = hilton_is_meaningless(cleaned)
-        if is_mless or not cleaned:
-            compounds.append(0.0)
-            confidences.append(0.0)
-            sentiments.append("Neutral")
-            translated_texts.append("")
-            methods_log.append("blank")
-            continue
-
-        # Language detection + translation
-        lang, lang_conf = hilton_detect_language(cleaned)
-        text_for_scoring = cleaned
-        trans = ""
-        if lang != "en":
-            translated, did_translate = hilton_smart_translate(cleaned, lang, lang_conf)
-            if did_translate:
-                text_for_scoring = translated
-                trans = translated
-        translated_texts.append(trans)
-
-        # Hybrid scoring
-        score, conf, _ = _hilton_hybrid_score(text_for_scoring)
-        compounds.append(round(score, 3))
-        confidences.append(round(conf, 3))
-        sentiments.append(classify_sentiment_hilton(score))
-        methods_log.append("hybrid")
-
-    if progress_cb:
-        progress_cb(n, n)
-
-    df["Translated_Text"]    = translated_texts
-    df["Text_For_Analysis"]  = [
-        (t if t else c) for t, c in zip(translated_texts, df["Cleaned_Comments"])
-    ]
-    df["consumer_score"]     = compounds
-    df["confidence"]         = confidences
-    df["consumer_sentiment"] = sentiments
-    df["validation_source"]  = sources
-    df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_hilton_negative_keywords)
-    return df
+    return domain, id_col, text_col
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════  NETFLIX (STREAMING) DOMAIN LOGIC  ════════════════════════
+# UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-NETFLIX_CONTENT_SET = {
-    "stranger things", "the crown", "bridgerton", "squid game", "money heist",
-    "ozark", "the witcher", "narcos", "breaking bad", "better call saul",
-    "black mirror", "the umbrella academy", "cobra kai", "prison break",
-    "you", "wednesday", "outer banks", "lucifer", "peaky blinders", "dark",
-    "mindhunter", "the sinner", "how to get away with murder", "criminal minds",
-    "the blacklist", "dexter", "bloodline", "kissing booth",
-    "bon appetite", "bon appetit",
-}
-
-NETFLIX_REMOVE_PATTERNS = [
-    r"chat with an agent", r"chat with agent", r"speak to agent",
-    r"talk to agent", r"connect me to agent", r"agent chat",
-    r"chat to agent", r"agent help", r"help chat",
-]
-_NETFLIX_REMOVE_RE = re.compile("|".join(NETFLIX_REMOVE_PATTERNS), re.IGNORECASE)
-
-NETFLIX_NEGATIVE_KEYWORDS = {
-    "payment_issues": [
-        "money is debited", "money was debited", "money was withdrawn",
-        "charged double", "being charged double", "double charged",
-        "unauthorized charge", "charged without permission",
-        "payment not going through", "unable to do payment",
-        "payment is pending", "payment failed", "payment issue",
-        "billing issue", "billing problem", "wrong amount charged",
-        "overcharged", "charged incorrectly",
-    ],
-    "access_issues": [
-        "cannot access", "cant access", "can't access", "unable to access",
-        "not working properly", "doesn't work", "does not work",
-        "not working", "stopped working", "no longer works",
-        "hacked my account", "account hacked", "compromised account",
-        "locked out", "account locked", "suspended account",
-        "login issue", "login problem", "can't login", "cannot login",
-    ],
-    "delivery_issues": [
-        "still have not received", "have not received", "not received",
-        "did not receive", "never received", "haven't received",
-        "waiting for", "still waiting", "no response",
-        "not delivered", "delivery failed",
-    ],
-    "unwanted_actions": [
-        "without my permission", "without permission", "without consent",
-        "i do not want this membership", "did not want to renew",
-        "did not want to restart", "didn't want to renew",
-        "auto renewed", "automatically renewed", "renewed without asking",
-        "charged after cancellation", "cancelled but charged",
-    ],
-    "technical_issues": [
-        "notifications are getting stuck", "getting stuck", "stuck",
-        "error message", "error occurred", "system error",
-        "technical issue", "technical problem", "glitch",
-        "buffering issue", "streaming problem", "won't load",
-        "keeps crashing", "app crashes", "freezing",
-    ],
-    "frustration": [
-        "frustrating", "frustrated", "annoyed", "angry",
-        "disappointed", "upset", "irritated", "furious",
-        "unacceptable", "ridiculous", "terrible", "horrible",
-        "worst", "pathetic", "useless", "awful",
-        "disgusted", "fed up", "sick of",
-    ],
-    "poor_service": [
-        "thanks for nothing", "no help", "not helpful", "unhelpful",
-        "you dont want to help", "you don't want to help",
-        "waste of time", "wasting my time", "poor service",
-        "bad service", "terrible service", "worst service",
-        "no support", "poor support", "terrible support",
-    ],
-    "resolution_issues": [
-        "not resolved", "still not resolved", "unresolved",
-        "no solution", "not fixed", "still broken",
-        "problem persists", "issue continues", "still having issues",
-        "unforeseen circumstances", "unexpected problem",
-    ],
-    "general_negative": [
-        "problem", "issue", "concern", "complaint",
-        "trouble", "difficulty", "struggle",
-        "wrong", "incorrect", "mistake", "error",
-        "broken", "damaged", "defective",
-        "lost", "missing", "disappeared",
-    ],
-}
-
-_NETFLIX_ALL_NEG_SORTED = sorted(
-    [kw for kws in NETFLIX_NEGATIVE_KEYWORDS.values() for kw in kws],
-    key=len, reverse=True,
-)
-_netflix_neg_kw_re = re.compile(
-    "|".join(re.escape(k) for k in _NETFLIX_ALL_NEG_SORTED), re.IGNORECASE
-)
-
-NETFLIX_NEGATIVE_TRIGGERS = [
-    "still have not received", "have not received", "not received",
-    "money is debited", "money was debited", "money was withdrawn",
-    "without my permission", "without permission",
-    "i do not want this membership", "did not want to renew",
-    "did not want to restart",
-    "thanks for nothing", "notifications are getting stuck", "getting stuck",
-    "unable to do payment", "payment is pending",
-    "frustrating", "frustrated", "annoyed", "angry",
-    "not working properly", "doesn't work", "cant access", "cannot access",
-    "hacked my account", "compromised account",
-    "charged double", "being charged double",
-    "unforeseen circumstances",
-    "you dont want to help", "you don't want to help",
-]
-
-NETFLIX_NEUTRAL_TRIGGERS = [
-    "want my refund back", "please refund", "need a refund",
-    "issue a refund", "can you refund",
-    "change email", "change my email", "update email", "switch to a different email",
-    "change the email address", "need to change my email",
-    "change my card", "change card details", "update payment",
-    "remove payment method", "verify my account with a credit card",
-    "change from premium to standard", "change plan", "switch plan",
-    "automatically changed", "change from standard to premium",
-    "how to", "how can i", "can i get", "is there any discount",
-    "questions about", "just wondering", "need to add",
-    "how to change", "help finding", "unable to access",
-    "device is not part", "can not access from",
-    "just canceled", "want to cancel", "can you cancel",
-    "verify my account", "finding current password",
-]
-
-NETFLIX_POSITIVE_TRIGGERS = [
-    "thank you", "thanks", "appreciate", "grateful",
-    "perfect", "helpful", "great", "excellent", "awesome",
-    "super helpful", "very helpful", "wonderful",
-    "thanks for the quick reply", "appreciate you looking into",
-    "thanks for clarifying", "thanks for explaining",
-]
-
-NETFLIX_VERY_POSITIVE_TRIGGERS = [
-    "bon appetite", "bon appetit",
-    "amazing", "outstanding", "exceeded expectations",
-    "extremely helpful", "incredibly helpful", "absolutely perfect",
-]
-
-_netflix_neg_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_NEGATIVE_TRIGGERS), re.IGNORECASE)
-_netflix_neu_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_NEUTRAL_TRIGGERS), re.IGNORECASE)
-_netflix_pos_trig    = re.compile("|".join(re.escape(p) for p in NETFLIX_POSITIVE_TRIGGERS), re.IGNORECASE)
-_netflix_vpos_trig   = re.compile("|".join(re.escape(p) for p in NETFLIX_VERY_POSITIVE_TRIGGERS), re.IGNORECASE)
-
-_NETFLIX_STRONG_NEG_PHRASES = [
-    "without my permission", "do not want this membership",
-    "did not want to renew", "thanks for nothing",
-    "unable to do payment", "still have not received",
-]
-
-
-def _netflix_extract_customer(text):
-    """Extract CUSTOMER messages from Netflix transcript format: [HH:MM:SS CUSTOMER]: ..."""
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    segs = re.findall(
-        r"\[\d{2}:\d{2}:\d{2}\s*CUSTOMER\]:\s*(.*?)(?=\[\d{2}:\d{2}:\d{2}\s*\w+\]:|$)",
-        text, flags=re.DOTALL | re.IGNORECASE,
-    )
-    return " ".join(re.sub(r"\s+", " ", s).strip() for s in segs if s.strip())
-
-
-def _netflix_clean(text):
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    text = _NETFLIX_REMOVE_RE.sub("", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) < 5 or len(text.split()) < 2:
-        return ""
-    return text
-
-
-def _netflix_remove_content_names(text):
-    if not isinstance(text, str) or not text.strip():
-        return text
-    t_lower = text.lower()
-    cleaned = text
-    for content in NETFLIX_CONTENT_SET:
-        if content in t_lower:
-            cleaned = re.compile(re.escape(content), re.IGNORECASE).sub("", cleaned)
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-
-def _netflix_classify_by_rules(text):
-    if not isinstance(text, str) or not text.strip():
-        return 0.0, 0.0
-    tl = text.lower()
-    if _netflix_vpos_trig.search(text) or _netflix_pos_trig.search(text):
-        pc = len(re.findall(r"\b(thank|thanks|appreciate|perfect|helpful)\b", tl))
-        if pc >= 2 or _netflix_vpos_trig.search(text):
-            return 0.85, 0.9
-        return 0.40, 0.8
-    if _netflix_neg_trig.search(text):
-        if has_resolution_or_thanks(text):
-            if len(_netflix_neg_trig.findall(text)) == 1 and any(w in tl[-50:] for w in ["thank", "thanks"]):
-                return 0.0, 0.75
-        if any(p in tl for p in _NETFLIX_STRONG_NEG_PHRASES):
-            return -0.65, 0.95
-        return -0.60, 0.80
-    if _netflix_neu_trig.search(text):
-        if is_polite_request(text):
-            return 0.0, 0.90
-        if "refund" in tl and any(p in tl for p in ["please", "want", "can you", "need"]):
-            return 0.0, 0.85
-        return 0.0, 0.80
-    return None, 0.0
-
-
-def _extract_netflix_neg_kw(text):
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    matches = _netflix_neg_kw_re.findall(text)
-    if not matches:
-        return ""
-    seen, found = set(), []
-    for m in matches:
-        ml = m.lower()
-        if ml not in seen:
-            seen.add(ml)
-            found.append(m)
-    return "; ".join(found)
-
-
-def run_netflix_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    """Netflix pipeline: extract customer → clean → remove content names → rule+VADER scoring."""
-    analyzer = load_vader()
-    df = df.copy()
-    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
-    df["CustomerOnly"] = df[text_col].apply(_netflix_extract_customer)
-    df["CustomerOnly_Cleaned"] = df["CustomerOnly"].apply(_netflix_clean)
-    df["CustomerOnly_Cleaned"] = df["CustomerOnly_Cleaned"].apply(_netflix_remove_content_names)
-    df["Text_For_Analysis"] = df["CustomerOnly_Cleaned"]
-
-    n = len(df)
-    compounds, confidences, sentiments, sources = [], [], [], []
-
-    for i, (_, row) in enumerate(df.iterrows()):
-        if progress_cb and i % max(1, n // 100) == 0:
-            progress_cb(i, n)
-        norm_id = row["_id_norm"]
-        text = row["Text_For_Analysis"]
-
-        if norm_id in validation_dict:
-            label = validation_dict[norm_id]
-            score = SENTIMENT_TO_SCORE.get(label, 0.0)
-            compounds.append(score); confidences.append(1.0)
-            sentiments.append(label); sources.append("Validation")
-            continue
-
-        sources.append("Model")
-        if not isinstance(text, str) or not text.strip():
-            compounds.append(0.0); confidences.append(0.0)
-            sentiments.append("Neutral"); continue
-
-        rule_score, conf = _netflix_classify_by_rules(text)
-        if rule_score is not None and conf > 0.7:
-            compounds.append(round(rule_score, 3))
-            confidences.append(conf)
-            sentiments.append(classify_sentiment(rule_score))
-        else:
-            vader_score = get_vader_compound(text, analyzer)
-            if abs(vader_score) < 0.05:
-                vader_score = 0.0
-            if rule_score is not None:
-                final = (rule_score * conf) + (vader_score * (1 - conf))
-            else:
-                final = vader_score
-            compounds.append(round(final, 3))
-            confidences.append(0.5)
-            sentiments.append(classify_sentiment(final))
-
-    if progress_cb:
-        progress_cb(n, n)
-
-    df["consumer_score"]     = compounds
-    df["confidence"]         = confidences
-    df["consumer_sentiment"] = sentiments
-    df["validation_source"]  = sources
-    df["Negative_Keywords"]  = df["Text_For_Analysis"].apply(_extract_netflix_neg_kw)
-    return df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════  SPOTIFY (MUSIC STREAMING) DOMAIN LOGIC  ══════════════════
-# ─────────────────────────────────────────────────────────────────────────────
-
-SPOTIFY_NEGATIVE_TRIGGERS = [
-    "not happy", "difficult", "still can't", "can't make payment",
-    "cannot make payment", "how much longer", "unwilling", "problem",
-    "issue", "refund not", "angry", "complaint",
-    "bad", "poor", "horrible", "terrible", "customer service", "no help",
-    "not satisfied", "disappointed", "policies aren't", "not resolved",
-    "not working", "doesn't work", "worse", "delay", "waiting too long",
-    "frustrated", "cancel", "unacceptable",
-]
-
-SPOTIFY_NEUTRAL_TRIGGERS = [
-    "want to talk", "continue conversation", "verify my", "reach out",
-    "need my spotify", "staff was friendly", "my account is reverted",
-    "I love Spotify", "label user", "no decline", "no billing",
-    "ad is coming", "i want a refund", "refund", "switch", "changed",
-    "changed my card", "i want to reach", "check my account",
-    "contact support", "login", "sign in", "update account",
-    "different subscription",
-]
-
-SPOTIFY_NEGATIVE_KEYWORDS = {
-    "payment_issues": [
-        "can't make payment", "cannot make payment", "refund not",
-        "billing", "overcharged", "charged incorrectly",
-    ],
-    "access_issues": [
-        "not working", "doesn't work", "login", "sign in",
-        "locked out", "account locked",
-    ],
-    "frustration": [
-        "not happy", "angry", "frustrated", "disappointed",
-        "not satisfied", "terrible", "horrible", "unacceptable",
-        "bad", "poor", "worse",
-    ],
-    "service_issues": [
-        "customer service", "no help", "not resolved",
-        "complaint", "delay", "waiting too long",
-        "difficult", "unwilling", "policies aren't",
-    ],
-    "general_negative": [
-        "problem", "issue", "cancel", "still can't",
-        "how much longer",
-    ],
-}
-
-_spotify_neg_trig = re.compile("|".join(re.escape(p) for p in SPOTIFY_NEGATIVE_TRIGGERS), re.IGNORECASE)
-_spotify_neu_trig = re.compile("|".join(re.escape(p) for p in SPOTIFY_NEUTRAL_TRIGGERS), re.IGNORECASE)
-
-_SPOTIFY_ALL_NEG_SORTED = sorted(
-    [kw for kws in SPOTIFY_NEGATIVE_KEYWORDS.values() for kw in kws],
-    key=len, reverse=True,
-)
-_spotify_neg_kw_re = re.compile(
-    "|".join(re.escape(k) for k in _SPOTIFY_ALL_NEG_SORTED), re.IGNORECASE
-)
-
-
-def _spotify_extract_consumer(text):
-    """Extract Consumer messages from Spotify pipe-delimited transcript format."""
-    if isinstance(text, str):
-        parts = text.split("|")
-        msgs = [p.split("Consumer:")[1].strip() for p in parts if "Consumer:" in p]
-        return " ".join(msgs).strip()
-    return ""
-
-
-def _spotify_adjust_score(text, score):
-    """Apply negative or neutral trigger overrides."""
-    if isinstance(text, str):
-        if _spotify_neg_trig.search(text):
-            return -0.6
-        if _spotify_neu_trig.search(text):
-            return 0.0
-    return score
-
-
-def _spotify_detect_language(text):
-    """Detect English vs non-English. Returns 'en' or 'non-en'."""
-    if not isinstance(text, str) or not text.strip():
-        return "non-en"
-    if not _LANGDETECT_OK:
-        return "en"
-    try:
-        from langdetect import detect as _detect
-        return "en" if _detect(text) == "en" else "non-en"
-    except Exception:
-        return "non-en"
-
-
-def _extract_spotify_neg_kw(text):
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    matches = _spotify_neg_kw_re.findall(text)
-    if not matches:
-        return ""
-    seen, found = set(), []
-    for m in matches:
-        ml = m.lower()
-        if ml not in seen:
-            seen.add(ml)
-            found.append(m)
-    return "; ".join(found)
-
-
-def run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb=None):
-    """
-    Spotify pipeline — mirrors notebook exactly:
-      1. Extract Consumer messages from pipe-delimited transcripts
-      2. Language detection (English only scored)
-      3. VADER scoring with trigger overrides
-      4. BERT correction for borderline scores (-0.1 to +0.1)
-      5. Final trigger re-enforcement after BERT (always wins)
-    """
-    analyzer = load_vader()
-    df = df.copy()
-    df["_id_norm"] = df[id_col].astype(str).str.strip().str.replace(" ", "")
-
-    # Step 1 — extract Consumer messages from pipe-delimited format
-    df["ConsumerOnly"] = df[text_col].apply(_spotify_extract_consumer)
-    # Step 2 — language detection
-    df["Language"] = df["ConsumerOnly"].apply(_spotify_detect_language)
-    df["Text_For_Analysis"] = df["ConsumerOnly"]
-
-    n          = len(df)
-    id_norms   = df["_id_norm"].tolist()
-    texts      = df["ConsumerOnly"].fillna("").tolist()
-    langs      = df["Language"].tolist()
-    val_labels = [validation_dict.get(nid) for nid in id_norms]
-
-    compounds   = np.zeros(n, dtype=np.float32)
-    confidences = np.zeros(n, dtype=np.float32)
-    sentiments  = np.full(n, "Neutral", dtype=object)
-    sources     = np.full(n, "Model",   dtype=object)
-
-    # Step 3 — VADER + trigger overrides
-    for i, (text, lang, val_lbl) in enumerate(zip(texts, langs, val_labels)):
-        if val_lbl is not None:
-            compounds[i]   = SENTIMENT_TO_SCORE.get(val_lbl, 0.0)
-            confidences[i] = 1.0
-            sentiments[i]  = val_lbl
-            sources[i]     = "Validation"
-            continue
-        if lang != "en" or not isinstance(text, str) or not text.strip():
-            continue  # non-English stays Neutral / 0
-        v   = get_vader_compound(text, analyzer)
-        v   = 0.0 if abs(v) < 0.05 else v
-        adj = _spotify_adjust_score(text, v)
-        compounds[i]   = round(adj, 3)
-        confidences[i] = 0.7
-        sentiments[i]  = classify_sentiment(adj)
-        if progress_cb and i % max(1, n // 50) == 0:
-            progress_cb(i, n)
-
-    df["consumer_score"]     = compounds.tolist()
-    df["confidence"]         = confidences.tolist()
-    df["consumer_sentiment"] = sentiments.tolist()
-    df["validation_source"]  = sources.tolist()
-
-    # Step 4 — BERT correction for borderline scores (-0.1 to +0.1)
-    # Only applied to English, non-validated, model-scored rows
-    _bert = _load_bert_optional()
-    if _bert is not None:
-        border_mask = (
-            df["consumer_score"].between(-0.1, 0.1)
-            & df["Language"].eq("en")
-            & df["validation_source"].eq("Model")
-        )
-        if border_mask.any():
-            texts_border = df.loc[border_mask, "ConsumerOnly"].tolist()
-            try:
-                bert_results = _bert(texts_border, batch_size=16, truncation=True)
-                for idx, result in zip(df.loc[border_mask].index, bert_results):
-                    lbl   = result["label"].lower()
-                    bconf = result["score"]
-                    if lbl == "positive":
-                        df.at[idx, "consumer_sentiment"] = "Positive"
-                        df.at[idx, "consumer_score"]     = round(bconf, 3)
-                        df.at[idx, "confidence"]         = round(bconf, 3)
-                    else:
-                        df.at[idx, "consumer_sentiment"] = "Negative"
-                        df.at[idx, "consumer_score"]     = round(-bconf, 3)
-                        df.at[idx, "confidence"]         = round(bconf, 3)
-            except Exception:
-                pass  # BERT failed gracefully — keep VADER scores
-
-    # Step 5 — Final trigger re-enforcement AFTER BERT (notebook Step 6)
-    # Triggers always win, even over BERT corrections
-    for idx, text in enumerate(df["ConsumerOnly"]):
-        if isinstance(text, str):
-            if _spotify_neg_trig.search(text):
-                df.at[idx, "consumer_score"]     = -0.6
-                df.at[idx, "consumer_sentiment"] = "Negative"
-            elif _spotify_neu_trig.search(text):
-                df.at[idx, "consumer_score"]     = 0.0
-                df.at[idx, "consumer_sentiment"] = "Neutral"
-
-    df["Negative_Keywords"] = df["Text_For_Analysis"].apply(_extract_spotify_neg_kw)
-    if progress_cb:
-        progress_cb(n, n)
-    return df
-
-# ── Unified dispatcher ────────────────────────────────────────────────────────
-def run_analysis(df, domain, id_col, text_col, validation_dict, progress_cb=None):
-    """Route to domain-specific analysis pipeline."""
-    if domain == "hilton":
-        return run_hilton_analysis(df, id_col, text_col, validation_dict, progress_cb)
-    elif domain == "netflix":
-        return run_netflix_analysis(df, id_col, text_col, validation_dict, progress_cb)
-    elif domain == "spotify":
-        return run_spotify_analysis(df, id_col, text_col, validation_dict, progress_cb)
-    else:
-        return run_ppt_analysis(df, id_col, text_col, validation_dict, progress_cb)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════════════  UI HELPERS  ════════════════════════════════════
-# ─────────────────────────────────────────────────────────────────────────────
-
 SENTIMENT_ORDER  = ["Very Positive", "Positive", "Neutral", "Negative", "Very Negative"]
+_SENT_PILL = {
+    "Very Positive": "🟢 Very Positive",
+    "Positive":      "🟡 Positive",
+    "Neutral":       "⚪ Neutral",
+    "Negative":      "🟠 Negative",
+    "Very Negative": "🔴 Very Negative",
+}
 SENTIMENT_COLORS = {
     "Very Positive": "#3D7A5F", "Positive": "#6B9E50",
-    "Neutral": "#6B8A99", "Negative": "#C87A40", "Very Negative": "#A04040",
+    "Neutral":       "#6B8A99", "Negative": "#C87A40", "Very Negative": "#A04040",
+}
+_CHIP_CLASS = {
+    "Very Positive": "c-vp", "Positive": "c-p",
+    "Neutral": "c-n", "Negative": "c-ng", "Very Negative": "c-vn",
+}
+_CHIP_ICON = {
+    "Very Positive": "▲▲", "Positive": "▲",
+    "Neutral": "—", "Negative": "▼", "Very Negative": "▼▼",
 }
 
-def mcard(label, value, color="var(--teal)"):
-    return (f'<div class="mc" style="border-top-color:{color}">'
-            f'<p class="mv">{value}</p><p class="ml">{label}</p></div>')
+def _chip(label: str) -> str:
+    cls  = _CHIP_CLASS.get(label, "c-n")
+    icon = _CHIP_ICON.get(label, "")
+    return f'<span class="chip {cls}">{icon} {label}</span>'
 
-def shdr(text, icon="📊"):
-    st.markdown(f'<div class="sh">{icon}&nbsp;{text}</div>', unsafe_allow_html=True)
+def mc_anim(label: str, value: str, color: str = "var(--teal)", delay: float = 0.0) -> str:
+    return (
+        f'<div class="mc-anim" style="border-top-color:{color}">'
+        f'<div class="mv" style="color:{color};animation-delay:{delay:.2f}s">{value}</div>'
+        f'<div class="ml">{label}</div>'
+        f'</div>'
+    )
 
-def _mfig(fig, h=380):
+def _sbar(score: float, domain: str = "") -> str:
+    norm = score / 10.0 if domain == "hilton" else score
+    norm = max(-1.0, min(1.0, norm))
+    pct  = int((norm + 1) / 2 * 100)
+    col  = "#3D7A5F" if norm >= 0.2 else "#A04040" if norm <= -0.2 else "#D4B94E"
+    return (
+        f'<div class="sbar">'
+        f'<div class="sbar-t"><div class="sbar-f" style="width:{pct}%;background:{col}"></div></div>'
+        f'<span style="color:{col};font-size:11px;font-weight:600;'
+        f'font-family:\'JetBrains Mono\',monospace;min-width:46px">{score:+.3f}</span>'
+        f'</div>'
+    )
+
+def _mfig(fig, h=360):
     fig.update_layout(
         font_family="DM Sans", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=20, t=40, b=10), height=h,
-        xaxis=dict(showgrid=True, gridcolor="rgba(168,188,200,.15)", zeroline=False),
-        yaxis=dict(showgrid=True, gridcolor="rgba(168,188,200,.15)", zeroline=False),
+        xaxis=dict(showgrid=True, gridcolor="rgba(168,188,200,.12)", zeroline=False),
+        yaxis=dict(showgrid=True, gridcolor="rgba(168,188,200,.12)", zeroline=False),
         hoverlabel=dict(bgcolor="#1E2D33", font_size=12, font_family="DM Sans", font_color="#E8E6DD"),
     )
     return fig
@@ -1701,106 +314,643 @@ def _read_file(raw, name):
     return pd.read_csv(buf) if name.endswith(".csv") else pd.read_excel(buf)
 
 
+_LOGO_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+    'viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="{sw}">'
+    '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>'
+)
+
+
+def _logo_icon(size: int = 34, sw: float = 1.8) -> str:
+    return (
+        f'<div style="width:{size}px;height:{size}px;border-radius:{round(size*0.26)}px;'
+        f'background:linear-gradient(135deg,#2D5F6E,#3A7A8C);flex-shrink:0;'
+        f'display:flex;align-items:center;justify-content:center;'
+        f'box-shadow:0 3px 10px rgba(45,95,110,.2)">'
+        f'{_LOGO_SVG.format(w=round(size*0.5), h=round(size*0.5), sw=sw)}</div>'
+    )
+
+
+def _sentiment_buckets(dist) -> tuple[int, int, int]:
+    """Return (pos_n, neu_n, neg_n) from a sentiment value_counts series/dict."""
+    pos_n = int(dist.get("Very Positive", 0)) + int(dist.get("Positive", 0))
+    neu_n = int(dist.get("Neutral", 0))
+    neg_n = int(dist.get("Negative", 0)) + int(dist.get("Very Negative", 0))
+    return pos_n, neu_n, neg_n
+
+
+def _explode_keywords(series: pd.Series) -> pd.Series:
+    """Split '; '-delimited keyword strings into a flat Series of individual keywords."""
+    return (
+        series.dropna()
+        .str.split("; ").explode().str.strip()
+        .loc[lambda s: s != ""]
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# ══════════════════════════════  SIDEBAR  ════════════════════════════════════
+# LANDING PAGE
 # ─────────────────────────────────────────────────────────────────────────────
+def render_landing():
+    st.html("""
+<style>
+/* Hide sidebar + header on landing */
+section[data-testid="stSidebar"]{display:none!important}
+header[data-testid="stHeader"]{display:none!important}
+#MainMenu{display:none!important}
+.stApp{background:#0C1418!important}
+.block-container{padding:0!important;max-width:100%!important}
+
+/* ── Keyframes ── */
+@keyframes fadeUp{from{opacity:0;transform:translateY(32px)}to{opacity:1;transform:translateY(0)}}
+@keyframes gradSweep{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+@keyframes pulse1{0%,100%{opacity:.18;transform:scale(1)}50%{opacity:.30;transform:scale(1.12)}}
+@keyframes pulse2{0%,100%{opacity:.12;transform:scale(1)}50%{opacity:.22;transform:scale(1.08)}}
+@keyframes pulse3{0%,100%{opacity:.10;transform:scale(1)}50%{opacity:.20;transform:scale(1.15)}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}
+@keyframes twFade{0%{opacity:0;transform:translateY(6px)}12%{opacity:1;transform:translateY(0)}88%{opacity:1;transform:translateY(0)}100%{opacity:0;transform:translateY(-6px)}}
+@keyframes barG{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+@keyframes countUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes borderPulse{0%,100%{border-color:rgba(212,185,78,.2)}50%{border-color:rgba(212,185,78,.55)}}
+
+/* ── HERO ── */
+.lp-hero{position:relative;min-height:100vh;background:#0C1418;overflow:hidden;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;padding:72px 24px 56px;text-align:center}
+.lp-orb1{position:absolute;width:600px;height:600px;border-radius:50%;
+  background:radial-gradient(circle,rgba(45,95,110,.55),transparent 70%);top:-120px;left:-100px;animation:pulse1 8s ease-in-out infinite}
+.lp-orb2{position:absolute;width:500px;height:500px;border-radius:50%;
+  background:radial-gradient(circle,rgba(212,185,78,.28),transparent 70%);bottom:-60px;right:-80px;animation:pulse2 10s ease-in-out 2s infinite}
+.lp-orb3{position:absolute;width:400px;height:400px;border-radius:50%;
+  background:radial-gradient(circle,rgba(61,122,95,.22),transparent 70%);bottom:10%;left:30%;animation:pulse3 12s ease-in-out 4s infinite}
+.lp-grid{position:absolute;inset:0;
+  background-image:linear-gradient(rgba(168,188,200,.04) 1px,transparent 1px),linear-gradient(90deg,rgba(168,188,200,.04) 1px,transparent 1px);
+  background-size:48px 48px;pointer-events:none}
+
+.lp-badge{display:inline-flex;align-items:center;gap:7px;background:rgba(212,185,78,.08);color:#D4B94E;
+  padding:8px 22px;border-radius:24px;font-size:11px;font-weight:600;letter-spacing:2px;text-transform:uppercase;
+  border:1px solid rgba(212,185,78,.22);animation:fadeUp .7s ease-out both;margin-bottom:28px;
+  animation:fadeUp .7s ease-out both,borderPulse 3s ease-in-out 1s infinite}
+.lp-badge-dot{width:7px;height:7px;border-radius:50%;background:#D4B94E;animation:pulse1 2s ease-in-out infinite}
+
+.lp-title{font-size:clamp(52px,8vw,86px);font-weight:700;line-height:1.04;letter-spacing:-2px;
+  background:linear-gradient(90deg,#6B8A99,#E8E6DD 18%,#D4B94E 38%,#E8E6DD 58%,#A8BCC8 78%,#6B8A99);
+  background-size:300% 300%;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  animation:fadeUp .7s ease-out .15s both,gradSweep 5s linear infinite;margin-bottom:0}
+.lp-sub{font-size:clamp(14px,2vw,17px);color:#8BBAC8;font-weight:400;margin:12px 0 0;
+  animation:fadeUp .7s ease-out .25s both;letter-spacing:.3px}
+
+.lp-tagline-wrap{height:36px;overflow:hidden;margin:24px 0 40px;animation:fadeUp .7s ease-out .35s both}
+.lp-tagline{font-size:clamp(15px,2.2vw,19px);color:#C0D8E0;font-weight:500;
+  animation:twFade 3.5s ease-in-out infinite;display:block}
+
+.lp-cta-row{display:flex;gap:14px;justify-content:center;flex-wrap:wrap;margin-bottom:60px;animation:fadeUp .8s ease-out .45s both}
+.lp-cta-primary{background:linear-gradient(135deg,#2D5F6E,#3A7A8C);color:#fff;border:none;
+  padding:16px 36px;border-radius:10px;font-size:15px;font-weight:600;cursor:pointer;
+  box-shadow:0 8px 28px rgba(45,95,110,.4);transition:all .25s;font-family:'DM Sans',sans-serif;letter-spacing:.3px}
+.lp-cta-primary:hover{transform:translateY(-2px);box-shadow:0 14px 36px rgba(45,95,110,.55)}
+.lp-cta-ghost{background:transparent;color:#A8BCC8;border:1px solid rgba(168,188,200,.25);
+  padding:16px 36px;border-radius:10px;font-size:15px;font-weight:500;cursor:pointer;
+  transition:all .25s;font-family:'DM Sans',sans-serif}
+.lp-cta-ghost:hover{border-color:rgba(168,188,200,.55);color:#E8E6DD;background:rgba(168,188,200,.06)}
+
+/* ── MOCKUP WINDOW ── */
+.lp-mock-wrap{width:min(780px,92vw);animation:fadeUp .9s ease-out .6s both,float 7s ease-in-out 2s infinite}
+.lp-window{background:rgba(18,30,36,.55);backdrop-filter:blur(24px);border:1px solid rgba(168,188,200,.1);
+  border-radius:18px;overflow:hidden;box-shadow:0 40px 100px rgba(0,0,0,.55)}
+.lp-wintitle{display:flex;align-items:center;gap:8px;padding:14px 20px;
+  background:rgba(10,18,22,.7);border-bottom:1px solid rgba(168,188,200,.07)}
+.lp-dot{width:12px;height:12px;border-radius:50%}
+.lp-winbody{padding:20px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.lp-kpi{background:rgba(255,255,255,.04);border:1px solid rgba(168,188,200,.08);border-radius:10px;
+  padding:14px 12px;text-align:center;border-top:3px solid}
+.lp-kpi-v{font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace;color:#E8E6DD;animation:countUp .5s ease-out 1.4s both}
+.lp-kpi-l{font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:#6B8A99;margin-top:4px}
+.lp-bars{padding:0 20px 20px;display:flex;align-items:flex-end;gap:8px;height:110px}
+.lp-bar{flex:1;border-radius:6px 6px 0 0;transform-origin:bottom;animation:barG .8s cubic-bezier(.34,1.56,.64,1) both}
+
+/* ── STATS ROW ── */
+.lp-stats{display:flex;justify-content:center;gap:56px;flex-wrap:wrap;
+  margin-top:56px;animation:fadeUp .7s ease-out .85s both}
+.lp-stat-n{font-size:38px;font-weight:700;font-family:'JetBrains Mono',monospace;
+  color:#E8E6DD;animation:countUp .6s ease-out 1.2s both;display:block}
+.lp-stat-l{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#6B8A99;margin-top:4px}
+
+/* ── DOMAINS SECTION ── */
+.lp-domains{background:#F5F4F0;padding:88px 40px;text-align:center}
+.lp-sec-badge{display:inline-block;background:rgba(45,95,110,.1);color:#2D5F6E;
+  padding:6px 18px;border-radius:20px;font-size:11px;font-weight:600;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:16px}
+.lp-sec-title{font-size:clamp(28px,4vw,40px);font-weight:700;color:#1E2D33;margin:0 0 12px;letter-spacing:-.5px}
+.lp-sec-sub{font-size:15px;color:#6B8A99;margin:0 auto 48px;max-width:520px;line-height:1.7}
+.lp-domain-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:20px;max-width:1100px;margin:0 auto}
+.lp-domain-card{background:#fff;border:1px solid #E0DDD6;border-radius:16px;padding:32px 26px;text-align:left;
+  transition:all .35s cubic-bezier(.25,.46,.45,.94);position:relative;overflow:hidden}
+.lp-domain-card::after{content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,#2D5F6E,#D4B94E);transform:scaleX(0);transform-origin:left;transition:transform .35s}
+.lp-domain-card:hover{transform:translateY(-8px);box-shadow:0 24px 64px rgba(45,95,110,.13);border-color:#2D5F6E}
+.lp-domain-card:hover::after{transform:scaleX(1)}
+.lp-domain-icon{font-size:36px;margin-bottom:16px;display:block}
+.lp-domain-name{font-size:16px;font-weight:700;color:#1E2D33;margin-bottom:6px}
+.lp-domain-tag{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1px;
+  color:#fff;background:#2D5F6E;border-radius:4px;padding:2px 8px;display:inline-block;margin-bottom:12px}
+.lp-domain-desc{font-size:13px;color:#6B8A99;line-height:1.65}
+.lp-domain-feats{margin-top:14px;display:flex;flex-wrap:wrap;gap:6px}
+.lp-feat-chip{font-size:10px;font-weight:500;color:#3D5A66;background:#F0EEE8;
+  border-radius:4px;padding:3px 9px;border:1px solid #E0DDD6}
+
+/* ── HOW IT WORKS ── */
+.lp-hiw{background:#0C1418;padding:88px 40px;text-align:center}
+.lp-hiw .lp-sec-title{color:#E8E6DD}
+.lp-hiw .lp-sec-sub{color:#8BBAC8}
+.lp-steps{display:flex;justify-content:center;align-items:flex-start;gap:0;flex-wrap:wrap;max-width:900px;margin:0 auto}
+.lp-step{flex:1;min-width:200px;padding:32px 24px;position:relative;
+  background:rgba(22,36,42,.5);backdrop-filter:blur(12px);border:1px solid rgba(168,188,200,.08);
+  border-radius:16px;margin:8px;transition:all .35s}
+.lp-step:hover{border-color:rgba(212,185,78,.3);transform:translateY(-6px)}
+.lp-step-n{width:52px;height:52px;border-radius:50%;
+  background:linear-gradient(135deg,#D4B94E,#E8D97A);color:#1E2D33;font-size:22px;font-weight:700;
+  display:flex;align-items:center;justify-content:center;margin:0 auto 18px;
+  box-shadow:0 6px 24px rgba(212,185,78,.35);animation:float 4s ease-in-out infinite}
+.lp-step-n:nth-child(1){animation-delay:0s}
+.lp-step-icon{font-size:26px;margin-bottom:10px}
+.lp-step-title{font-size:15px;font-weight:600;color:#E8E6DD;margin-bottom:8px}
+.lp-step-desc{font-size:12px;color:#8BBAC8;line-height:1.65}
+
+/* ── FEATURES ── */
+.lp-features{background:#F5F4F0;padding:88px 40px;text-align:center}
+.lp-feat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;max-width:1100px;margin:0 auto}
+.lp-feat-card{background:rgba(255,255,255,.75);backdrop-filter:blur(12px);
+  border:1px solid rgba(209,207,196,.5);border-radius:14px;padding:30px 24px;text-align:left;
+  transition:all .35s;position:relative;overflow:hidden}
+.lp-feat-card:hover{transform:translateY(-6px);box-shadow:0 18px 52px rgba(45,95,110,.1);
+  background:rgba(255,255,255,.95);border-color:#2D5F6E}
+.lp-feat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,#2D5F6E,#D4B94E);transform:scaleX(0);transform-origin:left;transition:transform .35s}
+.lp-feat-card:hover::before{transform:scaleX(1)}
+.lp-feat-ico{font-size:28px;margin-bottom:14px}
+.lp-feat-title{font-size:14px;font-weight:700;color:#1E2D33;margin-bottom:8px}
+.lp-feat-desc{font-size:12px;color:#6B8A99;line-height:1.65}
+
+/* ── FOOTER ── */
+.lp-footer{background:#080F12;padding:40px;text-align:center;
+  border-top:1px solid rgba(168,188,200,.06)}
+.lp-footer-name{font-size:18px;font-weight:700;color:#E8E6DD;margin-bottom:6px}
+.lp-footer-sub{font-size:12px;color:#6B8A99}
+</style>
+
+<div class="lp-hero">
+  <div class="lp-grid"></div>
+  <div class="lp-orb1"></div><div class="lp-orb2"></div><div class="lp-orb3"></div>
+
+  <div style="position:relative;z-index:2;width:100%;max-width:900px">
+    <div class="lp-badge"><span class="lp-badge-dot"></span>MULTI-DOMAIN SENTIMENT INTELLIGENCE</div>
+    <h1 class="lp-title">Sentix</h1>
+    <p class="lp-sub">See what your customers truly feel — across every channel, every conversation.</p>
+    <div class="lp-tagline-wrap">
+      <span class="lp-tagline" id="lp-tag">From transcript to insight in seconds.</span>
+    </div>
+
+    <div class="lp-mock-wrap" style="margin:0 auto">
+      <div class="lp-window">
+        <div class="lp-wintitle">
+          <div class="lp-dot" style="background:#FF5F57"></div>
+          <div class="lp-dot" style="background:#FEBC2E"></div>
+          <div class="lp-dot" style="background:#28C840"></div>
+          <span style="margin-left:12px;font-size:12px;color:#6B8A99;font-family:'DM Sans',sans-serif">Sentix — Sentiment Analysis</span>
+        </div>
+        <div class="lp-winbody">
+          <div class="lp-kpi" style="border-top-color:#3D7A5F">
+            <div class="lp-kpi-v" style="color:#3D7A5F">68%</div>
+            <div class="lp-kpi-l">Positive</div>
+          </div>
+          <div class="lp-kpi" style="border-top-color:#6B8A99">
+            <div class="lp-kpi-v" style="color:#6B8A99">18%</div>
+            <div class="lp-kpi-l">Neutral</div>
+          </div>
+          <div class="lp-kpi" style="border-top-color:#C87A40">
+            <div class="lp-kpi-v" style="color:#C87A40">14%</div>
+            <div class="lp-kpi-l">Negative</div>
+          </div>
+          <div class="lp-kpi" style="border-top-color:#D4B94E">
+            <div class="lp-kpi-v" style="color:#D4B94E">0.94</div>
+            <div class="lp-kpi-l">Confidence</div>
+          </div>
+        </div>
+        <div class="lp-bars">
+          <div class="lp-bar" style="height:82%;background:linear-gradient(180deg,#3D7A5F,#2D5F4A);animation-delay:.8s"></div>
+          <div class="lp-bar" style="height:55%;background:linear-gradient(180deg,#3D7A5F,#2D5F4A);animation-delay:.9s"></div>
+          <div class="lp-bar" style="height:70%;background:linear-gradient(180deg,#3D7A5F,#2D5F4A);animation-delay:1.0s"></div>
+          <div class="lp-bar" style="height:38%;background:linear-gradient(180deg,#6B8A99,#4A6870);animation-delay:1.1s"></div>
+          <div class="lp-bar" style="height:22%;background:linear-gradient(180deg,#C87A40,#A05828);animation-delay:1.2s"></div>
+          <div class="lp-bar" style="height:60%;background:linear-gradient(180deg,#3D7A5F,#2D5F4A);animation-delay:1.3s"></div>
+          <div class="lp-bar" style="height:88%;background:linear-gradient(180deg,#D4B94E,#B89830);animation-delay:1.4s"></div>
+          <div class="lp-bar" style="height:44%;background:linear-gradient(180deg,#3D7A5F,#2D5F4A);animation-delay:1.5s"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="lp-stats">
+      <div style="text-align:center"><span class="lp-stat-n">4</span><div class="lp-stat-l">Customer Domains</div></div>
+      <div style="text-align:center"><span class="lp-stat-n">5</span><div class="lp-stat-l">Sentiment Levels</div></div>
+      <div style="text-align:center"><span class="lp-stat-n">3</span><div class="lp-stat-l">AI Engines</div></div>
+      <div style="text-align:center"><span class="lp-stat-n">1-click</span><div class="lp-stat-l">Export</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- DOMAINS -->
+<div class="lp-domains">
+  <div class="lp-sec-badge">Supported Domains</div>
+  <h2 class="lp-sec-title">Built for every customer channel</h2>
+  <p class="lp-sec-sub">Purpose-built extraction and classification pipelines for each domain — not a one-size-fits-all model.</p>
+  <div class="lp-domain-grid" style="grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+    <div class="lp-domain-card">
+      <span class="lp-domain-icon">🏥</span>
+      <div class="lp-domain-name">Physical Therapy</div>
+      <span class="lp-domain-tag">PPT</span>
+      <div class="lp-domain-desc">HTML & SMS transcript parsing with customer-speaker isolation. Detects appointment, treatment, and billing frustrations.</div>
+      <div class="lp-domain-feats"><span class="lp-feat-chip">HTML transcripts</span><span class="lp-feat-chip">SMS logs</span><span class="lp-feat-chip">Speaker detection</span></div>
+    </div>
+    <div class="lp-domain-card">
+      <span class="lp-domain-icon">🏨</span>
+      <div class="lp-domain-name">Hilton Hospitality</div>
+      <span class="lp-domain-tag">Hilton</span>
+      <div class="lp-domain-desc">Multilingual feedback analysis with AFINN + TextBlob + VADER hybrid scoring. Auto-translates Spanish, French, and more.</div>
+      <div class="lp-domain-feats"><span class="lp-feat-chip">Multilingual</span><span class="lp-feat-chip">Hybrid scoring</span><span class="lp-feat-chip">Auto-translate</span></div>
+    </div>
+    <div class="lp-domain-card">
+      <span class="lp-domain-icon">🎬</span>
+      <div class="lp-domain-name">Netflix Streaming</div>
+      <span class="lp-domain-tag">Netflix</span>
+      <div class="lp-domain-desc">Pipe-delimited transcript parsing with consumer-turn extraction. Rule + VADER pipeline tuned for streaming support issues.</div>
+      <div class="lp-domain-feats"><span class="lp-feat-chip">Pipe-delimited</span><span class="lp-feat-chip">VADER adaptive</span><span class="lp-feat-chip">BERT correction</span></div>
+    </div>
+    <div class="lp-domain-card">
+      <span class="lp-domain-icon">🎵</span>
+      <div class="lp-domain-name">Spotify Music</div>
+      <span class="lp-domain-tag">Spotify</span>
+      <div class="lp-domain-desc">Consumer message extraction with language gating. DistilBERT correction for borderline scores in the ±0.1 zone.</div>
+      <div class="lp-domain-feats"><span class="lp-feat-chip">Language detection</span><span class="lp-feat-chip">DistilBERT</span><span class="lp-feat-chip">Borderline tuning</span></div>
+    </div>
+    <div class="lp-domain-card">
+      <span class="lp-domain-icon">🌐</span>
+      <div class="lp-domain-name">GoDaddy</div>
+      <span class="lp-domain-tag">GoDaddy</span>
+      <div class="lp-domain-desc">Domain & hosting support analysis. Covers DNS issues, email setup failures, OTP/auth problems, WordPress errors, SSL, and auto-renewal disputes.</div>
+      <div class="lp-domain-feats"><span class="lp-feat-chip">DNS & hosting</span><span class="lp-feat-chip">10 issue categories</span><span class="lp-feat-chip">VADER + BERT</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS -->
+<div class="lp-hiw">
+  <div class="lp-sec-badge" style="background:rgba(212,185,78,.1);color:#D4B94E;border:1px solid rgba(212,185,78,.2)">How It Works</div>
+  <h2 class="lp-sec-title" style="color:#E8E6DD">Three steps to complete insight</h2>
+  <p class="lp-sec-sub" style="color:#8BBAC8">No configuration required. Upload your data, select the domain, and get results.</p>
+  <div class="lp-steps">
+    <div class="lp-step">
+      <div class="lp-step-n">1</div>
+      <div class="lp-step-icon">📁</div>
+      <div class="lp-step-title">Upload Your Data</div>
+      <div class="lp-step-desc">Drop in an Excel or CSV with your conversation transcripts. Auto-detect identifies the domain and column mapping instantly.</div>
+    </div>
+    <div class="lp-step">
+      <div class="lp-step-n" style="animation-delay:.5s">2</div>
+      <div class="lp-step-icon">⚡</div>
+      <div class="lp-step-title">Analyse at Scale</div>
+      <div class="lp-step-desc">Parallel VADER scoring, rule-based overrides, and optional DistilBERT correction — all in one click. Thousands of rows in seconds.</div>
+    </div>
+    <div class="lp-step">
+      <div class="lp-step-n" style="animation-delay:1s">3</div>
+      <div class="lp-step-icon">📊</div>
+      <div class="lp-step-title">Act on Insights</div>
+      <div class="lp-step-desc">Drill into keyword categories, inspect individual records with full lineage, and export a 3-sheet Excel workbook for stakeholders.</div>
+    </div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<div class="lp-features">
+  <div class="lp-sec-badge">Capabilities</div>
+  <h2 class="lp-sec-title">Everything you need to understand customers</h2>
+  <p class="lp-sec-sub">From raw transcripts to executive-ready reports — no data science team required.</p>
+  <div class="lp-feat-grid">
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">🧠</div>
+      <div class="lp-feat-title">Adaptive AI Pipeline</div>
+      <div class="lp-feat-desc">Three-layer classification: rule matching → VADER fallback → DistilBERT correction. Confidence-weighted blending for maximum accuracy.</div>
+    </div>
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">✅</div>
+      <div class="lp-feat-title">Validation Overrides</div>
+      <div class="lp-feat-desc">Upload a ground-truth Excel to lock in human-verified labels. Overrides take highest priority — model predictions never touch validated rows.</div>
+    </div>
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">🔍</div>
+      <div class="lp-feat-title">Keyword Intelligence</div>
+      <div class="lp-feat-desc">Category-level negative keyword breakdown with drill-down charts, sentiment mix per category, and highlighted sample comments.</div>
+    </div>
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">🔒</div>
+      <div class="lp-feat-title">PII Redaction</div>
+      <div class="lp-feat-desc">Toggle to mask emails, phone numbers, SSNs, and card numbers in the display — without altering the underlying analysis or export.</div>
+    </div>
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">📋</div>
+      <div class="lp-feat-title">Audit Trail</div>
+      <div class="lp-feat-desc">Full decision lineage for every record — see which rule fired, the raw VADER score, BERT correction, and final confidence step by step.</div>
+    </div>
+    <div class="lp-feat-card">
+      <div class="lp-feat-ico">📤</div>
+      <div class="lp-feat-title">One-Click Export</div>
+      <div class="lp-feat-desc">Download a 3-sheet Excel workbook (Results · Summary · Keywords) or a filtered CSV — timestamp-named and ready for stakeholders.</div>
+    </div>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<div class="lp-footer">
+  <div class="lp-footer-name">Sentix</div>
+  <div class="lp-footer-sub">Multi-Domain Sentiment Intelligence · VADER Adaptive · Built with Streamlit</div>
+</div>
+
+<script>
+const tags = [
+  "From transcript to insight in seconds.",
+  "100% of conversations. Zero manual effort.",
+  "Know what your customers truly feel.",
+  "Four domains. One platform. Total clarity.",
+];
+let ti = 0;
+const el = document.getElementById("lp-tag");
+if(el){
+  setInterval(() => {
+    el.style.animation = "none";
+    void el.offsetWidth;
+    ti = (ti + 1) % tags.length;
+    el.textContent = tags[ti];
+    el.style.animation = "twFade 3.5s ease-in-out infinite";
+  }, 3500);
+}
+</script>
+""")
+
+    # ── CTA button rendered by Streamlit (so it can trigger navigation) ────────
+    _, col, _ = st.columns([2, 1, 2])
+    with col:
+        if st.button("🚀  Start Analysing", type="primary", key="lp_cta", use_container_width=True):
+            st.session_state._page = "Upload & Analyse"
+            st.rerun()
+
+
+def _page_state(id_col, text_col, domain):
+    """Retrieve per-page column/domain state, falling back to sidebar values."""
+    return (
+        st.session_state.get("_id_col",   id_col),
+        st.session_state.get("_text_col", text_col),
+        st.session_state.get("_domain",   domain),
+    )
+
+
+def _csv_download(df: pd.DataFrame, label: str, slug: str, key: str, suffix: str = "sentiment"):
+    st.download_button(
+        label,
+        data=df.to_csv(index=False).encode(),
+        file_name=f"{slug}_{suffix}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv", width='stretch', key=key,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _build_cat_summary(text_values: tuple, kw_dict_items: tuple, total: int):
+    s = pl.Series("t", list(text_values))
+    result = []
+    for cat, keywords in kw_dict_items:
+        if not keywords:
+            continue
+        pattern = "(?i)" + "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True))
+        mask = s.str.contains(pattern, literal=False).fill_null(False).to_list()
+        cnt  = sum(mask)
+        if cnt > 0:
+            result.append({
+                "cat": cat, "label": cat.replace("_", " ").title(),
+                "records": cnt, "pct": round(cnt / total * 100, 1), "mask": mask,
+            })
+    result.sort(key=lambda x: x["records"], reverse=True)
+    return result
+
+
+def _exec_banner(dist, total, pt, val_n, domain_label):
+    pos_n, neu_n, neg_n = _sentiment_buckets(dist)
+    neg_pct = neg_n / total if total else 0
+    pos_pct = pos_n / total if total else 0
+
+    if pos_pct >= 0.5:
+        mood = f"<strong style='color:#7FD9AC'>{pos_pct:.0%} positive</strong>"
+    elif neg_pct >= 0.4:
+        mood = f"<strong style='color:#F4A0A0'>⚠ {neg_pct:.0%} negative</strong>"
+    else:
+        mood = (f"<strong style='color:#7FD9AC'>{pos_pct:.0%} positive</strong> and "
+                f"<strong style='color:#F4A0A0'>{neg_pct:.0%} negative</strong>")
+
+    val_note = f", with <strong>{val_n:,}</strong> validation overrides" if val_n else ""
+    summary  = (
+        f"<strong>{total:,} {domain_label} records</strong> analysed in "
+        f"<strong>{pt:.1f}s</strong>{val_note}. Sentiment: {mood}."
+    )
+    stats = [
+        (f"{pos_pct:.0%}", "Positive"),
+        (f"{neu_n / total:.0%}" if total else "0%", "Neutral"),
+        (f"{neg_pct:.0%}", "Negative"),
+    ]
+    if val_n:
+        stats.append((f"{val_n:,}", "Validated"))
+    stats_html = "".join(
+        f'<span class="exec-stat"><span>{v}</span> {l}</span>' for v, l in stats
+    )
+    st.markdown(
+        f'<div class="exec-banner">'
+        f'<div class="exec-label">Executive Summary</div>'
+        f'<div class="exec-text">{summary}</div>'
+        f'<div class="exec-stats">{stats_html}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _get_kw_dict(dom):
+    if dom == "hilton":
+        from domains.hilton import HILTON_NEGATIVE_KEYWORDS
+        return HILTON_NEGATIVE_KEYWORDS
+    elif dom == "netflix":
+        from domains.netflix import NETFLIX_NEGATIVE_KEYWORDS
+        return NETFLIX_NEGATIVE_KEYWORDS
+    elif dom == "spotify":
+        from domains.spotify import SPOTIFY_NEGATIVE_KEYWORDS
+        return SPOTIFY_NEGATIVE_KEYWORDS
+    elif dom == "godaddy":
+        from domains.godaddy import GODADDY_NEGATIVE_KEYWORDS
+        return GODADDY_NEGATIVE_KEYWORDS
+    else:
+        from domains.ppt import NEGATIVE_KEYWORDS
+        return NEGATIVE_KEYWORDS
+
+
+def _detail_card(row: pd.Series, text_cols: set, score_col: str,
+                 sent_col: str, domain: str, redact: bool = False):
+    """Render a full detail panel for one record."""
+    fields = []
+    for col, val in row.items():
+        if col.startswith("_"):
+            continue
+        if col == sent_col:
+            fields.append((col, _chip(str(val)), True))
+        elif col == score_col:
+            try:
+                fields.append((col, _sbar(float(val), domain), True))
+            except (ValueError, TypeError):
+                fields.append((col, _html.escape(str(val)), True))
+        elif col in text_cols and isinstance(val, str):
+            display = _redact(val) if redact else val
+            fields.append((col, _html.escape(display), True))
+        elif not (pd.isna(val) if not isinstance(val, str) else False):
+            fields.append((col, _html.escape(str(val)), False))
+
+    html_parts = ['<div class="detail-card">']
+    # Long text fields last
+    short_fields = [(l, v, h) for l, v, h in fields if not (len(v) > 120)]
+    long_fields  = [(l, v, h) for l, v, h in fields if len(v) > 120]
+
+    # 3-column grid for short fields
+    html_parts.append('<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px 24px;margin-bottom:14px">')
+    for label, val, is_html in short_fields:
+        display_val = val if is_html else _html.escape(str(val))
+        html_parts.append(
+            f'<div><div class="detail-label">{_html.escape(label)}</div>'
+            f'<div class="detail-value">{display_val}</div></div>'
+        )
+    html_parts.append('</div>')
+
+    # Full-width long text fields
+    for label, val, _ in long_fields:
+        html_parts.append(
+            f'<div style="margin-top:10px"><div class="detail-label">{_html.escape(label)}</div>'
+            f'<div class="detail-value" style="white-space:pre-wrap;word-break:break-word">{val}</div></div>'
+        )
+    html_parts.append('</div>')
+    st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────────────────
+def _on_domain_change():
+    domain = st.session_state["sb_domain"]
+    cfg    = DOMAIN_CONFIG[domain]
+    cols   = st.session_state.get("_file_cols")
+    if cols:
+        if cfg["id_default"] in cols:
+            st.session_state["sb_id"] = cfg["id_default"]
+        if cfg["text_default"] in cols:
+            st.session_state["sb_text"] = cfg["text_default"]
+    else:
+        st.session_state["sb_id"]   = cfg["id_default"]
+        st.session_state["sb_text"] = cfg["text_default"]
 
 with st.sidebar:
-    st.markdown("""
-    <div style="display:flex;align-items:center;gap:10px;padding:10px 0 14px">
-      <div style="width:36px;height:36px;border-radius:10px;
-           background:linear-gradient(135deg,#2D5F6E,#3A7A8C);
-           display:flex;align-items:center;justify-content:center">
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-             viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5">
-          <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-        </svg>
-      </div>
-      <div>
-        <span style="font-size:16px;font-weight:700;color:#1E2D33">SentimentHub</span><br>
-        <span style="font-size:11px;color:#6B8A99;font-style:italic">Multi-Domain · Vader Adaptive</span>
-      </div>
-    </div>""", unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:10px;padding:10px 0 14px">'
+        f'{_logo_icon(34, 1.8)}'
+        f'<div><span style="font-size:15px;font-weight:700;color:#1E2D33">Sentix</span><br>'
+        f'<span style="font-size:11px;color:#7A95A2">Multi-Domain · VADER Adaptive</span></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
     st.divider()
 
-    # Navigation
-    PAGES = ["Upload & Analyse", "Reports & Insights", "Keyword Analysis", "Audit Trail"]
+    PAGES = ["Home", "Upload & Analyse", "Reports & Insights", "Keyword Analysis", "Audit Trail"]
     if "_page" not in st.session_state:
-        st.session_state._page = "Upload & Analyse"
+        st.session_state._page = "Home"
     nav_target = st.session_state.pop("_nav_target", None)
     if nav_target and nav_target in PAGES:
         st.session_state._page = nav_target
 
-    st.markdown('<div style="font-size:11px;font-weight:600;color:#6B8A99;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:6px">Navigation</div>',
-                unsafe_allow_html=True)
     NAV_ICONS = {
-        "Upload & Analyse":  ":material/upload:",
-        "Reports & Insights":":material/analytics:",
-        "Keyword Analysis":  ":material/search:",
-        "Audit Trail":       ":material/visibility:",
+        "Home":               ":material/home:",
+        "Upload & Analyse":   ":material/upload:",
+        "Reports & Insights": ":material/analytics:",
+        "Keyword Analysis":   ":material/search:",
+        "Audit Trail":        ":material/visibility:",
     }
     for p in PAGES:
         active = st.session_state._page == p
-        if st.button(p, key=f"nav_{p}", icon=NAV_ICONS[p],
-                     use_container_width=True,
+        if st.button(p, key=f"nav_{p}", icon=NAV_ICONS[p], width='stretch',
                      type="primary" if active else "secondary"):
             st.session_state._page = p
             st.rerun()
     page = st.session_state._page
     st.divider()
 
-    # Domain selector
-    st.markdown("**🌐 Domain**")
+    st.caption("DOMAIN")
     domain = st.selectbox(
         "Select domain",
         list(DOMAIN_CONFIG.keys()),
         format_func=lambda k: DOMAIN_CONFIG[k]["label"],
         key="sb_domain",
+        on_change=_on_domain_change,
+        label_visibility="collapsed",
     )
     _dcfg = DOMAIN_CONFIG[domain]
     st.divider()
 
-    # Column mapping (defaults update with domain)
-    st.markdown("**⚙️ Column Mapping**")
-    id_col   = st.text_input("ID Column",           value=_dcfg["id_default"],   key="sb_id")
-    text_col = st.text_input("Conversation Column", value=_dcfg["text_default"], key="sb_text")
+    st.caption("COLUMN MAPPING")
+    _file_cols = st.session_state.get("_file_cols")
+    if _file_cols:
+        _id_val = st.session_state.get("sb_id",   _dcfg["id_default"])
+        _tx_val = st.session_state.get("sb_text", _dcfg["text_default"])
+        if _id_val not in _file_cols:
+            st.session_state["sb_id"]   = _file_cols[0]
+        if _tx_val not in _file_cols:
+            st.session_state["sb_text"] = _file_cols[min(1, len(_file_cols) - 1)]
+        id_col   = st.selectbox("ID Column",           _file_cols, key="sb_id")
+        text_col = st.selectbox("Conversation Column", _file_cols, key="sb_text")
+    else:
+        id_col   = st.text_input("ID Column",           value=_dcfg["id_default"],   key="sb_id")
+        text_col = st.text_input("Conversation Column", value=_dcfg["text_default"], key="sb_text")
     st.divider()
 
-    # Validation file
-    st.markdown("**🛡️ Validation Override**")
+    st.caption("VALIDATION OVERRIDE")
     val_file = st.file_uploader(
         "Validation Excel (optional)", type=["xlsx"], key="sb_val",
-        help="Must have ID and 'Actual Sentiment' columns."
+        help="Must have ID and 'Actual Sentiment' columns.",
+        label_visibility="collapsed",
     )
     st.divider()
 
-    # Threshold (PPT only — shown for completeness)
-    st.markdown("**🎛️ Options**")
-    rule_threshold = st.slider("Rule confidence threshold", 0.50, 0.99, 0.70, 0.05)
+    st.caption("OPTIONS")
+    rule_threshold = st.slider("Rule confidence threshold", 0.50, 0.99, 0.70, 0.05,
+                                label_visibility="visible")
+    redact_pii = st.toggle("Redact PII in display", value=False,
+                           help="Masks emails, phone numbers, SSNs and card numbers.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # APP HEADER
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div style="display:flex;align-items:center;gap:14px;margin-bottom:4px">
-  <div style="width:44px;height:44px;border-radius:12px;
-       background:linear-gradient(135deg,#2D5F6E,#3A7A8C);
-       display:flex;align-items:center;justify-content:center;
-       flex-shrink:0;box-shadow:0 4px 12px rgba(45,95,110,.25)">
-    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22"
-         viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.5">
-      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
-    </svg>
-  </div>
-  <div>
-    <h1 style="margin:0;font-size:24px;line-height:1.2;color:#1E2D33">SentimentHub</h1>
-    <p style="margin:0;color:#6B8A99;font-size:12px" id="app-domain-label">
-      Multi-Domain Sentiment Analysis · VADER Adaptive
-    </p>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 0 — HOME / LANDING
+# ─────────────────────────────────────────────────────────────────────────────
+if page == "Home":
+    render_landing()
+    st.stop()
+
+st.markdown(
+    f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">'
+    f'{_logo_icon(40, 1.6)}'
+    f'<div><h1 style="margin:0;font-size:22px;line-height:1.2;color:#1E2D33">Sentix</h1>'
+    f'<p style="margin:0;color:#7A95A2;font-size:12px">Multi-Domain Sentiment Intelligence · VADER Adaptive</p></div>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
 st.divider()
 
 
@@ -1808,75 +958,86 @@ st.divider()
 # PAGE 1 — UPLOAD & ANALYSE
 # ─────────────────────────────────────────────────────────────────────────────
 if page == "Upload & Analyse":
-    shdr("Upload & Analyse", "📤")
 
-    # Show last-run summary
     if "result" in st.session_state:
         out = st.session_state.result
-        n   = len(out)
-        t   = st.session_state.get("_run_time", 0)
         fn  = st.session_state.get("_filename", "data")
+        t   = st.session_state.get("_run_time", 0)
         v   = int((out["validation_source"] == "Validation").sum())
-        st.markdown(
-            f'<div style="background:var(--card);border:1px solid var(--border);'
-            f'border-radius:10px;padding:12px 16px;margin-bottom:14px;'
-            f'border-left:3px solid var(--success)">'
-            f'<span style="color:var(--success);font-weight:600">✓ {fn}</span>'
-            f'<span style="color:var(--muted);font-size:13px;margin-left:8px">'
-            f'{n:,} records analysed in {t:.1f}s'
-            f'{f" · {v:,} validation overrides" if v else ""}'
-            f' — see Reports ›</span></div>',
-            unsafe_allow_html=True)
+        extra = f" · {v:,} validation overrides" if v else ""
+        st.caption(f"Last run: **{_html.escape(fn)}** — {len(out):,} records in {t:.1f}s{extra}. View results in Reports ›")
 
-    # File upload
     uploaded = st.file_uploader(
         "Upload conversation data (Excel or CSV)",
-        type=["xlsx", "csv"], label_visibility="visible", key="main_upload"
+        type=["xlsx", "csv"], key="main_upload",
     )
     if uploaded is None:
-        st.info("⬆️ Upload a file to get started. The file must contain an ID column and a conversation/comments column.")
+        st.markdown(
+            '<p style="color:var(--muted);font-size:13px;margin-top:8px">'
+            'Upload an Excel or CSV file with an ID column and a conversation/comments column.'
+            '</p>',
+            unsafe_allow_html=True,
+        )
         st.stop()
+
+    raw_bytes = uploaded.read()
+    file_hash = hashlib.md5(raw_bytes).hexdigest()[:10]
 
     with st.spinner("Reading file…"):
-        df_raw = _read_file(uploaded.read(), uploaded.name)
+        df_raw = _read_file(raw_bytes, uploaded.name)
 
-    st.success(f"Loaded **{len(df_raw):,}** rows × {len(df_raw.columns)} columns from `{uploaded.name}`")
+    # Store columns for sidebar selectboxes on new file
+    if st.session_state.get("_last_file_hash") != file_hash:
+        st.session_state["_file_cols"]      = list(df_raw.columns)
+        st.session_state["_last_file_hash"] = file_hash
 
-    # Column check
+    # Auto-detect on first load of this file
+    if st.session_state.get("_last_autodetect") != file_hash:
+        detected = _detect_domain(df_raw)
+        if detected:
+            det_domain, det_id, det_text = detected
+            st.session_state["_pending_domain"] = det_domain
+            st.session_state["_pending_id"]     = det_id
+            st.session_state["_pending_text"]   = det_text
+        st.session_state["_last_autodetect"] = file_hash
+        st.rerun()
+
+    # File info line
+    det_label = DOMAIN_CONFIG[domain]["label"].split(" — ")[0]
+    st.markdown(
+        f'<p style="color:var(--muted);font-size:12px;margin:4px 0 12px">'
+        f'<strong style="color:var(--text)">{len(df_raw):,} rows</strong> · '
+        f'{len(df_raw.columns)} columns · '
+        f'Auto-detected as <strong style="color:var(--teal)">{det_label}</strong> · '
+        f'ID: <code>{id_col}</code> · Text: <code>{text_col}</code>'
+        f'</p>',
+        unsafe_allow_html=True,
+    )
+
     missing = [c for c in [id_col, text_col] if c not in df_raw.columns]
     if missing:
-        st.error(f"Column(s) **{missing}** not found. Available columns: `{list(df_raw.columns)}`")
+        st.error(f"Column(s) **{missing}** not found. Available: `{list(df_raw.columns)}`")
         st.stop()
 
-    with st.expander("Preview raw data (first 5 rows)"):
-        st.dataframe(df_raw[[id_col, text_col]].head(5), use_container_width=True)
+    with st.expander("Preview (first 5 rows)"):
+        st.dataframe(df_raw[[id_col, text_col]].head(5), width='stretch')
 
-    # Validation summary
     validation_dict = {}
     if val_file:
         val_file.seek(0)
         validation_dict = load_validation_data(val_file)
         if validation_dict:
-            st.markdown(
-                f'<span class="badge b-ok">✓ {len(validation_dict):,} validation records loaded</span>',
-                unsafe_allow_html=True)
+            st.caption(f"Validation file loaded — {len(validation_dict):,} records.")
         else:
-            st.markdown('<span class="badge b-warn">⚠️ Validation file loaded but no records matched expected columns</span>',
-                        unsafe_allow_html=True)
+            st.warning("Validation file loaded but no records matched expected columns.")
     st.divider()
 
-    # Domain badge
-    st.markdown(
-        f'<span class="badge b-info">🌐 {DOMAIN_CONFIG[domain]["label"]}</span>',
-        unsafe_allow_html=True)
-
-    # Run button
     _, rc, _ = st.columns([1, 2, 1])
     with rc:
         _btn_label = DOMAIN_CONFIG[domain]["label"].split(" — ")[0]
         run = st.button(
-            f"🚀 Run {_btn_label} Sentiment Analysis  ({len(df_raw):,} records)",
-            type="primary", use_container_width=True
+            f"Run {_btn_label} Analysis  ({len(df_raw):,} records)",
+            type="primary", width='stretch',
         )
 
     if run:
@@ -1889,20 +1050,22 @@ if page == "Upload & Analyse":
 
         with st.spinner("Running analysis…"):
             result_df = run_analysis(
-                df_raw, domain, id_col, text_col, validation_dict, update_progress
+                df_raw, domain, id_col, text_col,
+                validation_dict, update_progress, rule_threshold,
             )
 
         elapsed = time.time() - t0
-        prog.progress(100, text=f"✓ Done — {len(result_df):,} records in {elapsed:.1f}s")
+        prog.progress(100, text=f"Done — {len(result_df):,} records in {elapsed:.1f}s")
 
-        st.session_state.result      = result_df
-        st.session_state._run_time   = elapsed
-        st.session_state._filename   = uploaded.name
-        st.session_state._id_col     = id_col
-        st.session_state._text_col   = text_col
-        st.session_state._domain     = domain
+        st.session_state.result          = result_df
+        st.session_state._run_time       = elapsed
+        st.session_state._filename       = uploaded.name
+        st.session_state._id_col         = id_col
+        st.session_state._text_col       = text_col
+        st.session_state._domain         = domain
+        st.session_state._rule_threshold = rule_threshold
 
-        st.toast(f"Analysis complete: {len(result_df):,} records classified in {elapsed:.1f}s")
+        st.toast(f"Done — {len(result_df):,} records in {elapsed:.1f}s")
         st.rerun()
 
 
@@ -1910,230 +1073,179 @@ if page == "Upload & Analyse":
 # PAGE 2 — REPORTS & INSIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
 elif page == "Reports & Insights":
-    shdr("Reports & Insights", "📊")
 
     if "result" not in st.session_state:
-        st.info("No results yet. Go to **Upload & Analyse** first.")
+        st.info("Run analysis first — go to Upload & Analyse.")
         st.stop()
 
-    out   = st.session_state.result
-    id_col   = st.session_state.get("_id_col", id_col)
-    text_col = st.session_state.get("_text_col", text_col)
-    total = len(out)
-    dist  = out["consumer_sentiment"].value_counts()
-    pt    = st.session_state.get("_run_time", 0)
-    src   = out["validation_source"].value_counts()
+    out                      = st.session_state.result
+    id_col, text_col, _domain = _page_state(id_col, text_col, domain)
+    total    = len(out)
+    dist     = out["consumer_sentiment"].value_counts()
+    pt       = st.session_state.get("_run_time", 0)
+    val_n              = int((out["validation_source"] == "Validation").sum())
+    pos_n, neu_n, neg_n = _sentiment_buckets(dist)
 
-    # ── KPI row ──────────────────────────────────────────────────────────────
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.markdown(mcard("Total Records",    f"{total:,}"),                                            unsafe_allow_html=True)
-    k2.markdown(mcard("Analysis Time",    f"{pt:.1f}s",   "var(--slate)"),                          unsafe_allow_html=True)
-    k3.markdown(mcard("Very Negative",    str(dist.get("Very Negative", 0)), "#A04040"),             unsafe_allow_html=True)
-    k4.markdown(mcard("Negative",         str(dist.get("Negative", 0)),      "#C87A40"),             unsafe_allow_html=True)
-    k5.markdown(mcard("Neutral",          str(dist.get("Neutral", 0)),        "var(--slate)"),       unsafe_allow_html=True)
-    k6.markdown(mcard("Positive / Very+", str(dist.get("Positive", 0) + dist.get("Very Positive", 0)), "var(--success)"),
-                unsafe_allow_html=True)
+    _exec_banner(dist, total, pt, val_n, DOMAIN_CONFIG[_domain]["label"].split(" — ")[0])
 
-    # Source badges
-    val_n   = int(src.get("Validation", 0))
-    model_n = int(src.get("Model", 0))
+    # KPI row — 5 cards
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.markdown(mc_anim("Total Records",   f"{total:,}",                      delay=0.00), unsafe_allow_html=True)
+    k2.markdown(mc_anim("Analysis Time",   f"{pt:.1f}s", "var(--slate)",      delay=0.05), unsafe_allow_html=True)
+    k3.markdown(mc_anim("Negative",        f"{neg_n:,}", "#C87A40",           delay=0.10), unsafe_allow_html=True)
+    k4.markdown(mc_anim("Neutral",         f"{neu_n:,}", "var(--slate)", delay=0.15), unsafe_allow_html=True)
+    k5.markdown(mc_anim("Positive",        f"{pos_n:,}", "#3D7A5F",           delay=0.20), unsafe_allow_html=True)
 
-    # Count rule vs vader inside Model rows
-    rule_n  = int((out[(out["validation_source"] == "Model") & (out["confidence"] > 0.5)].shape[0]))
-    vader_n = int((out[(out["validation_source"] == "Model") & (out["confidence"] <= 0.5)].shape[0]))
-
-    st.markdown(
-        f'<div style="margin:8px 0 4px">'
-        f'<span class="badge b-info">Validation override: {val_n:,}</span> &nbsp;'
-        f'<span class="badge b-ok">Rule-based: {rule_n:,}</span> &nbsp;'
-        f'<span class="badge b-warn">VADER fallback: {vader_n:,}</span>'
-        f'</div>',
-        unsafe_allow_html=True)
     st.divider()
 
-    tab_dist, tab_score, tab_data = st.tabs(["Distribution", "Score Analysis", "Full Results"])
+    tab_summary, tab_evidence = st.tabs(["Summary", "Evidence"])
 
-    # ── Distribution tab ─────────────────────────────────────────────────────
-    with tab_dist:
+    # ── Summary ───────────────────────────────────────────────────────────────
+    with tab_summary:
         ordered = [s for s in SENTIMENT_ORDER if s in dist.index]
         counts  = [int(dist[s]) for s in ordered]
         colors  = [SENTIMENT_COLORS[s] for s in ordered]
         pcts    = [round(c / total * 100, 1) for c in counts]
 
-        # Bar chart
-        fig_bar = go.Figure(go.Bar(
-            x=ordered, y=counts,
-            marker=dict(color=colors, cornerradius=6, line=dict(width=0)),
-            text=[f"{p}%" for p in pcts],
-            textposition="outside",
-            textfont=dict(size=13, color="#2D5F6E", family="DM Sans"),
-            hovertemplate="<b>%{x}</b><br>Count: %{y:,}<br>Share: %{text}<extra></extra>",
-        ))
-        _mfig(fig_bar, 380).update_layout(
-            title=dict(text="Sentiment Distribution", font=dict(size=15, color="#1E2D33"), x=0),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_bar, use_container_width=True, key="rpt_bar")
+        col_donut, col_bar = st.columns([1, 2])
 
-        c1, c2 = st.columns(2)
-        with c1:
-            # Pie chart
-            fig_pie = go.Figure(go.Pie(
-                labels=ordered, values=counts,
-                marker=dict(colors=colors, line=dict(color="#FFFFFF", width=2)),
-                textinfo="label+percent", hole=0.4,
+        with col_donut:
+            bucket_labels = ["Positive", "Neutral", "Negative"]
+            bucket_colors = ["#3D7A5F", "#6B8A99", "#A04040"]
+            bucket_counts = [pos_n, neu_n, neg_n]
+            fig_donut = go.Figure(go.Pie(
+                labels=bucket_labels,
+                values=bucket_counts,
+                marker=dict(colors=bucket_colors, line=dict(width=0)),
+                hole=0.62,
+                textinfo="percent",
+                textfont=dict(size=12, family="DM Sans"),
                 hovertemplate="<b>%{label}</b><br>%{value:,} records (%{percent})<extra></extra>",
             ))
-            fig_pie.update_layout(
-                font_family="DM Sans", paper_bgcolor="rgba(0,0,0,0)",
-                height=320, margin=dict(l=10, r=10, t=30, b=10),
-                title=dict(text="Sentiment Share", font=dict(size=14, color="#1E2D33"), x=0),
+            _mfig(fig_donut, 300).update_layout(
+                title=dict(text="Sentiment Breakdown", font=dict(size=13, color="#1E2D33"), x=0),
                 showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
+                legend=dict(orientation="h", y=-0.12, font=dict(size=11)),
+                margin=dict(l=10, r=10, t=40, b=30),
             )
-            st.plotly_chart(fig_pie, use_container_width=True, key="rpt_pie")
+            st.plotly_chart(fig_donut, width='stretch', key="rpt_donut")
 
-        with c2:
-            # Source breakdown donut
-            src_labels  = ["Validation Override", "Rule-based", "VADER Fallback"]
-            src_values  = [val_n, rule_n, vader_n]
-            src_colors  = ["#3D7A5F", "#2D5F6E", "#D4B94E"]
-            fig_src = go.Figure(go.Pie(
-                labels=src_labels, values=src_values,
-                marker=dict(colors=src_colors, line=dict(color="#FFFFFF", width=2)),
-                textinfo="label+percent", hole=0.4,
-                hovertemplate="<b>%{label}</b><br>%{value:,} records<extra></extra>",
+        with col_bar:
+            fig_bar = go.Figure(go.Bar(
+                x=ordered, y=counts,
+                marker=dict(color=colors, cornerradius=5, line=dict(width=0)),
+                text=[f"{p}%" for p in pcts], textposition="outside",
+                textfont=dict(size=12, color="#2D5F6E", family="DM Sans"),
+                hovertemplate="<b>%{x}</b><br>%{y:,} records (%{text})<extra></extra>",
             ))
-            fig_src.update_layout(
-                font_family="DM Sans", paper_bgcolor="rgba(0,0,0,0)",
-                height=320, margin=dict(l=10, r=10, t=30, b=10),
-                title=dict(text="Classification Source", font=dict(size=14, color="#1E2D33"), x=0),
-                showlegend=True,
-                legend=dict(orientation="h", yanchor="bottom", y=-0.25, xanchor="center", x=0.5),
-            )
-            st.plotly_chart(fig_src, use_container_width=True, key="rpt_src")
-
-    # ── Score Analysis tab ────────────────────────────────────────────────────
-    with tab_score:
-        c1, c2 = st.columns(2)
-        with c1:
-            fig_hist = go.Figure(go.Histogram(
-                x=out["consumer_score"], nbinsx=40,
-                marker=dict(
-                    color=out["consumer_score"].apply(
-                        lambda s: "#A04040" if s < -0.2 else "#3D7A5F" if s > 0.2 else "#6B8A99"
-                    ),
-                    line=dict(width=0),
-                ),
-                hovertemplate="Score: %{x:.2f}<br>Count: %{y:,}<extra></extra>",
-            ))
-            _mfig(fig_hist, 340).update_layout(
-                title=dict(text="Compound Score Distribution", font=dict(size=14, color="#1E2D33"), x=0),
-                bargap=0.05,
-            )
-            st.plotly_chart(fig_hist, use_container_width=True, key="rpt_hist")
-
-        with c2:
-            conf_bins = pd.cut(
-                out["confidence"],
-                bins=[0, 0.3, 0.6, 0.8, 1.01],
-                labels=["Low\n(<0.3)", "Medium\n(0.3–0.6)", "High\n(0.6–0.8)", "Very High\n(>0.8)"]
-            )
-            conf_dist = conf_bins.value_counts().sort_index()
-            fig_conf = go.Figure(go.Bar(
-                x=conf_dist.index.tolist(), y=conf_dist.values,
-                marker=dict(
-                    color=["#A04040", "#C87A40", "#3A7A8C", "#3D7A5F"],
-                    cornerradius=6, line=dict(width=0)
-                ),
-                text=[f"{v:,}" for v in conf_dist.values],
-                textposition="outside",
-                textfont=dict(size=12, color="#2D5F6E"),
-            ))
-            _mfig(fig_conf, 340).update_layout(
-                title=dict(text="Confidence Band Distribution", font=dict(size=14, color="#1E2D33"), x=0),
+            _mfig(fig_bar, 300).update_layout(
+                title=dict(text="Sentiment Distribution", font=dict(size=13, color="#1E2D33"), x=0),
                 showlegend=False,
             )
-            st.plotly_chart(fig_conf, use_container_width=True, key="rpt_conf")
+            st.plotly_chart(fig_bar, width='stretch', key="rpt_bar")
 
-        # Sentiment by source stacked bar
-        shdr("Sentiment by Classification Source", "📈")
-        src_sent = out.groupby(["validation_source", "consumer_sentiment"]).size().reset_index(name="Count")
-        fig_ss = go.Figure()
-        for sent in SENTIMENT_ORDER:
-            sub = src_sent[src_sent["consumer_sentiment"] == sent]
-            fig_ss.add_trace(go.Bar(
-                x=sub["validation_source"], y=sub["Count"],
-                name=sent,
-                marker=dict(color=SENTIMENT_COLORS[sent], cornerradius=4),
-                hovertemplate=f"<b>{sent}</b><br>Source: %{{x}}<br>Count: %{{y:,}}<extra></extra>",
-            ))
-        _mfig(fig_ss, 360).update_layout(
-            barmode="stack", title=dict(text="Sentiment by Source", font=dict(size=14, color="#1E2D33"), x=0),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=11)),
-        )
-        st.plotly_chart(fig_ss, use_container_width=True, key="rpt_ss")
+        # Key stats row
+        scores_norm = out["consumer_score"] / 10.0 if _domain == "hilton" else out["consumer_score"]
+        valid_scores = scores_norm.dropna()
+        high_conf_n  = int((out["confidence"] > 0.7).sum())
+        val_pct      = round(val_n / total * 100, 1) if total else 0
 
-    # ── Full Results tab ──────────────────────────────────────────────────────
-    with tab_data:
-        f1, f2 = st.columns(2)
-        with f1:
-            filt_sent = st.multiselect("Filter by sentiment", SENTIMENT_ORDER, default=[], key="rpt_filt_sent")
-        with f2:
-            filt_src = st.multiselect("Filter by source", ["Validation", "Model"], default=[], key="rpt_filt_src")
+        sk1, sk2, sk3, sk4 = st.columns(4)
+        sk1.markdown(mc_anim("Avg Score",        f"{valid_scores.mean():+.3f}", "var(--teal)",  delay=0.00), unsafe_allow_html=True)
+        sk2.markdown(mc_anim("Median Score",     f"{valid_scores.median():+.3f}", "var(--slate)", delay=0.05), unsafe_allow_html=True)
+        sk3.markdown(mc_anim("High Confidence",  f"{high_conf_n:,}", "#3D7A5F",  delay=0.10), unsafe_allow_html=True)
+        sk4.markdown(mc_anim("Validation Override", f"{val_pct}%", "#D4B94E",   delay=0.15), unsafe_allow_html=True)
 
-        disp = out.copy()
+        # Top negative keywords strip
+        if "Negative_Keywords" in out.columns:
+            top_kws = (
+                _explode_keywords(out["Negative_Keywords"])
+                .value_counts().head(7).index.tolist()
+            )
+            if top_kws:
+                kw_html = " &nbsp;·&nbsp; ".join(f"<code>{_html.escape(kw)}</code>" for kw in top_kws)
+                st.markdown(
+                    f'<div style="background:var(--warm-l);border-radius:8px;padding:11px 16px;'
+                    f'margin-top:14px;border-left:3px solid var(--gold);font-size:13px;color:var(--text2)">'
+                    f'<strong>Top negative signals:</strong> {kw_html}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Evidence ──────────────────────────────────────────────────────────────
+    with tab_evidence:
+        filt_kw = st.text_input("Search keywords / text", placeholder="e.g. wait time, billing…", key="rpt_filt_kw")
+        filt_sent = st.pills("Sentiment", SENTIMENT_ORDER, selection_mode="multi", default=None, key="rpt_filt_sent")
+        filt_src  = st.pills("Source", ["Validation", "Model"], selection_mode="multi", default=None, key="rpt_filt_src")
+
+        disp = out
         if filt_sent: disp = disp[disp["consumer_sentiment"].isin(filt_sent)]
         if filt_src:  disp = disp[disp["validation_source"].isin(filt_src)]
+        if filt_kw.strip():
+            _kw_lower = filt_kw.strip().lower()
+            _search_cols = [c for c in ["Negative_Keywords", "Text_For_Analysis", text_col] if c in disp.columns]
+            _mask = pd.Series(False, index=disp.index)
+            for _sc in _search_cols:
+                _mask |= disp[_sc].fillna("").astype(str).str.lower().str.contains(_kw_lower, regex=False)
+            disp = disp[_mask]
 
-        show_cols = [c for c in [
-            id_col, text_col, "CustomerOnly", "consumer_sentiment",
-            "consumer_score", "confidence", "validation_source", "Negative_Keywords"
-        ] if c in disp.columns]
-        st.markdown(f'<span class="badge b-info">{len(disp):,} rows shown</span>', unsafe_allow_html=True)
-        st.dataframe(disp[show_cols].reset_index(drop=True), use_container_width=True, height=420)
+        ev_cols = [c for c in [id_col, "consumer_sentiment", "consumer_score", "confidence", "validation_source", "Negative_Keywords"] if c in disp.columns]
+        ev_df   = disp[ev_cols].reset_index(drop=True)
+        if "consumer_sentiment" in ev_df.columns:
+            ev_df = ev_df.assign(consumer_sentiment=ev_df["consumer_sentiment"].map(_SENT_PILL).fillna(ev_df["consumer_sentiment"]))
+
+        st.caption(f"{len(ev_df):,} records — click a row to inspect")
+        ev_sel = st.dataframe(
+            ev_df,
+            on_select="rerun",
+            selection_mode="single-row",
+            width='stretch',
+            height=360,
+            key="rpt_ev_sel",
+            column_config={
+                "consumer_sentiment": st.column_config.TextColumn("Sentiment", width="medium"),
+                "consumer_score":     st.column_config.NumberColumn("Score", format="%.3f", width="small"),
+                "confidence":         st.column_config.ProgressColumn("Confidence", min_value=0, max_value=1, format="%.2f", width="small"),
+                "validation_source":  st.column_config.TextColumn("Source", width="small"),
+                "Negative_Keywords":  st.column_config.TextColumn("Keywords", width="large"),
+            },
+        )
+        selected_rows = ev_sel.selection.rows if hasattr(ev_sel, "selection") else []
+        if selected_rows:
+            orig_idx = disp.index[selected_rows[0]]
+            detail_text_cols = {text_col, "CustomerOnly", "CustomerOnly_Cleaned",
+                                "Text_For_Analysis", "Negative_Keywords", "Translated_Text"}
+            with st.expander("Record detail", expanded=True):
+                _detail_card(out.loc[orig_idx], detail_text_cols,
+                             "consumer_score", "consumer_sentiment", _domain, redact_pii)
 
     # ── Export ────────────────────────────────────────────────────────────────
     st.divider()
-    shdr("Export Results", "⬇️")
-    _dl_domain = st.session_state.get("_domain", "sentiment")
+    st.markdown("**Export**")
     e1, e2 = st.columns(2)
     with e1:
-        st.download_button(
-            "⬇️ Download CSV",
-            data=out.to_csv(index=False).encode(),
-            file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv", use_container_width=True, key="dl_csv",
-        )
+        _csv_download(out, "Download CSV", _domain, key="dl_csv")
     with e2:
         xls_buf = io.BytesIO()
         with pd.ExcelWriter(xls_buf, engine="openpyxl") as writer:
-            # Sheet 1 — Full results
             out.to_excel(writer, sheet_name="Results", index=False)
-            # Sheet 2 — Summary
             summary_rows = []
             for sent in SENTIMENT_ORDER:
                 cnt = int(dist.get(sent, 0))
-                summary_rows.append({
-                    "Sentiment": sent,
-                    "Count": cnt,
-                    "%": round(cnt / total * 100, 1) if total else 0,
-                })
+                summary_rows.append({"Sentiment": sent, "Count": cnt,
+                                     "%": round(cnt / total * 100, 1) if total else 0})
             pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
-            # Sheet 3 — Negative keywords
-            kw_all = (out["Negative_Keywords"].dropna()
-                      .str.split("; ").explode().str.strip()
-                      .loc[lambda s: s != ""])
-            if not kw_all.empty:
-                kw_df = kw_all.value_counts().reset_index()
-                kw_df.columns = ["Keyword", "Count"]
-                kw_df.to_excel(writer, sheet_name="Keywords", index=False)
+            if "Negative_Keywords" in out.columns:
+                kw_all = _explode_keywords(out["Negative_Keywords"])
+                if not kw_all.empty:
+                    kw_df = kw_all.value_counts().reset_index()
+                    kw_df.columns = ["Keyword", "Count"]
+                    kw_df.to_excel(writer, sheet_name="Keywords", index=False)
         st.download_button(
-            "⬇️ Download Excel (3 sheets)",
+            "Download Excel (3 sheets)",
             data=xls_buf.getvalue(),
-            file_name=f"{_dl_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            file_name=f"{_domain}_sentiment_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True, key="dl_excel",
+            width='stretch', key="dl_excel",
         )
 
 
@@ -2141,166 +1253,337 @@ elif page == "Reports & Insights":
 # PAGE 3 — KEYWORD ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 elif page == "Keyword Analysis":
-    shdr("Negative Keyword Analysis", "🔍")
 
     if "result" not in st.session_state:
         st.info("Run analysis first."); st.stop()
 
-    out = st.session_state.result
+    out                           = st.session_state.result
+    id_col, text_col, _active_domain = _page_state(id_col, text_col, domain)
+    total = len(out)
 
-    kw_series = (
-        out["Negative_Keywords"].dropna()
-        .str.split("; ").explode().str.strip()
-        .loc[lambda s: s != ""]
+    _kw_dict     = _get_kw_dict(_active_domain)
+    text_src_col = "Text_For_Analysis" if "Text_For_Analysis" in out.columns else text_col
+    text_series  = out[text_src_col].fillna("")
+
+    cat_summary = _build_cat_summary(
+        tuple(text_series.tolist()),
+        tuple((cat, tuple(kws)) for cat, kws in _kw_dict.items()),
+        total,
     )
 
-    if kw_series.empty:
-        st.markdown('<span class="badge b-ok">No negative keywords found in dataset.</span>',
-                    unsafe_allow_html=True)
-        st.stop()
+    if not cat_summary:
+        st.info("No negative keywords found."); st.stop()
 
-    # ── Top keywords chart ────────────────────────────────────────────────────
-    top_n = st.slider("Top N keywords to display", 10, 60, 30, key="kw_topn")
-    kw_counts = kw_series.value_counts().head(top_n).reset_index()
-    kw_counts.columns = ["Keyword", "Count"]
-
-    fig_kw = go.Figure(go.Bar(
-        y=kw_counts["Keyword"], x=kw_counts["Count"],
-        orientation="h",
-        marker=dict(
-            color=kw_counts["Count"],
-            colorscale=[[0, "#F0E6C8"], [0.5, "#C87A40"], [1, "#A04040"]],
-            cornerradius=4, line=dict(width=0),
-        ),
-        text=[f"{v:,}" for v in kw_counts["Count"]],
+    # ── Category overview bar chart ───────────────────────────────────────────
+    ov_labels  = [cs["label"] for cs in cat_summary]
+    ov_counts  = [cs["records"] for cs in cat_summary]
+    ov_pcts    = [cs["pct"] for cs in cat_summary]
+    # colour gradient: darker orange for higher counts
+    _max_ov = max(ov_counts) if ov_counts else 1
+    ov_colors  = [
+        f"rgba({int(168 + 40 * (c / _max_ov))},{int(90 + 30 * (1 - c / _max_ov))},{int(30 + 20 * (1 - c / _max_ov))},0.85)"
+        for c in ov_counts
+    ]
+    fig_ov = go.Figure(go.Bar(
+        y=ov_labels, x=ov_counts, orientation="h",
+        marker=dict(color=ov_colors, cornerradius=5, line=dict(width=0)),
+        text=[f"{p}%  ({v:,})" for p, v in zip(ov_pcts, ov_counts)],
         textposition="outside",
         textfont=dict(size=11, color="#2D5F6E", family="DM Sans"),
-        hovertemplate="<b>%{y}</b><br>Occurrences: %{x:,}<extra></extra>",
+        hovertemplate="<b>%{y}</b><br>%{x:,} records (%{text})<extra></extra>",
     ))
-    _mfig(fig_kw, max(380, top_n * 26)).update_layout(
+    _mfig(fig_ov, max(240, len(ov_labels) * 32)).update_layout(
         yaxis={"categoryorder": "total ascending"},
-        title=dict(text=f"Top {top_n} Negative Keywords / Phrases", font=dict(size=15, color="#1E2D33"), x=0),
-        showlegend=False, coloraxis_showscale=False,
+        title=dict(text="Issue Categories — Record Count", font=dict(size=14, color="#1E2D33"), x=0),
+        showlegend=False,
+        xaxis=dict(showgrid=True, gridcolor="rgba(168,188,200,.15)"),
     )
-    st.plotly_chart(fig_kw, use_container_width=True, key="kw_main")
+    st.plotly_chart(fig_ov, width='stretch', key="kw_overview")
 
-    # ── By category ───────────────────────────────────────────────────────────
     st.divider()
-    shdr("Keywords by Issue Category", "📋")
-    _active_domain = st.session_state.get("_domain", "ppt")
-    _kw_dict_map = {
-        "ppt":     (NEGATIVE_KEYWORDS,         "PPT"),
-        "hilton":  (HILTON_NEGATIVE_KEYWORDS,  "Hilton"),
-        "netflix": (NETFLIX_NEGATIVE_KEYWORDS, "Netflix"),
-        "spotify": (SPOTIFY_NEGATIVE_KEYWORDS, "Spotify"),
-    }
-    _kw_dict, _dict_label = _kw_dict_map.get(_active_domain, (NEGATIVE_KEYWORDS, "PPT"))
-    st.markdown(f"Each category reflects the issue group from the **{_dict_label}** keyword dictionary.")
 
-    cat_data = []
-    for cat, keywords in _kw_dict.items():
-        cat_pattern = re.compile(
-            "|".join(re.escape(k) for k in sorted(keywords, key=len, reverse=True)),
-            re.IGNORECASE
-        )
-        total_hits = out["Text_For_Analysis"].dropna().apply(
-            lambda t: bool(cat_pattern.search(str(t)))
-        ).sum()
-        if total_hits > 0:
-            cat_data.append({"Category": cat.replace("_", " ").title(), "Records with hits": int(total_hits)})
+    # ── Drill into selected category ──────────────────────────────────────────
+    sel_label = st.selectbox("Select issue category to drill in",
+                             [cs["label"] for cs in cat_summary], key="kw_cat_sel")
+    cs_data   = next(c for c in cat_summary if c["label"] == sel_label)
+    _mask_arr = np.array(cs_data["mask"], dtype=bool)
+    cat_out   = out.loc[out.index[_mask_arr]]
 
-    if cat_data:
-        cat_df = pd.DataFrame(cat_data).sort_values("Records with hits", ascending=False)
-        fig_cat = go.Figure(go.Bar(
-            y=cat_df["Category"], x=cat_df["Records with hits"],
-            orientation="h",
-            marker=dict(
-                color=cat_df["Records with hits"],
-                colorscale=[[0, "#D6E8EE"], [0.5, "#3A7A8C"], [1, "#1E3A44"]],
-                cornerradius=4, line=dict(width=0),
-            ),
-            text=[f"{v:,}" for v in cat_df["Records with hits"]],
-            textposition="outside",
-            textfont=dict(size=11, color="#2D5F6E"),
-            hovertemplate="<b>%{y}</b><br>Records: %{x:,}<extra></extra>",
+    neg_in_cat  = int(cat_out["consumer_sentiment"].isin(["Negative", "Very Negative"]).sum())
+    pos_in_cat  = int(cat_out["consumer_sentiment"].isin(["Positive", "Very Positive"]).sum())
+    neu_in_cat  = int((cat_out["consumer_sentiment"] == "Neutral").sum())
+    cat_total   = int(cs_data["records"])
+    neg_pct_cat = round(neg_in_cat / cat_total * 100, 1) if cat_total else 0
+
+    col_kw, col_donut, col_meta = st.columns([3, 2, 2])
+
+    with col_kw:
+        cat_keywords = set(_kw_dict.get(cs_data["cat"], []))
+        kw_s = _explode_keywords(cat_out["Negative_Keywords"])
+        if cat_keywords:
+            kw_s = kw_s[kw_s.isin(cat_keywords)]
+        if kw_s.empty:
+            kw_s = _explode_keywords(cat_out["Negative_Keywords"])
+
+        if not kw_s.empty:
+            kw_counts = kw_s.value_counts().head(15).reset_index()
+            kw_counts.columns = ["Keyword", "Count"]
+            _kmax = kw_counts["Count"].max()
+            kw_bar_colors = [
+                f"rgba({int(160 + 48 * (v / _kmax))},{int(80 + 42 * (1 - v / _kmax))},40,0.85)"
+                for v in kw_counts["Count"]
+            ]
+            fig_kw = go.Figure(go.Bar(
+                y=kw_counts["Keyword"], x=kw_counts["Count"], orientation="h",
+                marker=dict(color=kw_bar_colors, cornerradius=4, line=dict(width=0)),
+                text=[f"{v:,}" for v in kw_counts["Count"]], textposition="outside",
+                textfont=dict(size=11, color="#2D5F6E"),
+                hovertemplate="<b>%{y}</b><br>%{x:,} hits<extra></extra>",
+            ))
+            _mfig(fig_kw, max(300, len(kw_counts) * 28)).update_layout(
+                yaxis={"categoryorder": "total ascending"},
+                title=dict(text=f"Top keywords — {sel_label}", font=dict(size=13, color="#1E2D33"), x=0),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_kw, width='stretch', key="kw_drill")
+        else:
+            st.caption("No keyword breakdown available for this category.")
+
+    with col_donut:
+        fig_cd = go.Figure(go.Pie(
+            labels=["Positive", "Neutral", "Negative"],
+            values=[pos_in_cat, neu_in_cat, neg_in_cat],
+            marker=dict(colors=["#3D7A5F", "#6B8A99", "#A04040"], line=dict(width=0)),
+            hole=0.60,
+            textinfo="percent",
+            textfont=dict(size=11, family="DM Sans"),
+            hovertemplate="<b>%{label}</b><br>%{value:,} records (%{percent})<extra></extra>",
         ))
-        _mfig(fig_cat, max(300, len(cat_df) * 32)).update_layout(
-            yaxis={"categoryorder": "total ascending"},
-            title=dict(text="Issue Category Frequency", font=dict(size=14, color="#1E2D33"), x=0),
-            showlegend=False, coloraxis_showscale=False,
+        _mfig(fig_cd, 280).update_layout(
+            title=dict(text="Sentiment mix in category", font=dict(size=13, color="#1E2D33"), x=0),
+            showlegend=True,
+            legend=dict(orientation="h", y=-0.15, font=dict(size=10)),
+            margin=dict(l=10, r=10, t=40, b=30),
         )
-        st.plotly_chart(fig_cat, use_container_width=True, key="kw_cat")
+        st.plotly_chart(fig_cd, width='stretch', key="kw_cd")
 
-    # ── Filter by sentiment ───────────────────────────────────────────────────
-    st.divider()
-    shdr("Filter Keywords by Sentiment", "🎯")
-    sent_pick = st.selectbox("Show keywords for", ["All"] + SENTIMENT_ORDER, key="kw_sent_pick")
-    filtered = out if sent_pick == "All" else out[out["consumer_sentiment"] == sent_pick]
-    kw2 = (filtered["Negative_Keywords"].dropna()
-           .str.split("; ").explode().str.strip()
-           .loc[lambda s: s != ""])
-    if not kw2.empty:
-        kw2_df = kw2.value_counts().head(25).reset_index()
-        kw2_df.columns = ["Keyword", "Count"]
-        st.dataframe(kw2_df, use_container_width=True, hide_index=True)
-    else:
-        st.info(f"No keywords found for {sent_pick}.")
+    with col_meta:
+        _neg_color = "#A04040" if neg_pct_cat >= 50 else "#C87A40" if neg_pct_cat >= 25 else "#6B8A99"
+        st.markdown(
+            f'<div class="detail-card">'
+            f'<div class="detail-label">Impacted Records</div>'
+            f'<div class="mv" style="color:#C87A40;font-size:28px;margin-bottom:2px">{cat_total:,}</div>'
+            f'<div style="font-size:12px;color:var(--muted);margin-bottom:14px">{cs_data["pct"]}% of dataset</div>'
+            f'<div class="detail-label">Negative Sentiment</div>'
+            f'<div style="font-size:20px;font-weight:700;color:{_neg_color}">{neg_pct_cat}%</div>'
+            f'<div style="font-size:12px;color:var(--muted);margin-bottom:14px">{neg_in_cat:,} records</div>'
+            f'<div class="detail-label">Positive Sentiment</div>'
+            f'<div style="font-size:16px;font-weight:600;color:#3D7A5F">'
+            f'{round(pos_in_cat / cat_total * 100, 1) if cat_total else 0}%</div>'
+            f'<div style="font-size:12px;color:var(--muted)">{pos_in_cat:,} records</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        samples = cat_out[text_src_col].dropna().astype(str).head(3).tolist()
+        if samples:
+            cat_kw_set = set(_kw_dict.get(cs_data["cat"], []))
+            st.markdown(
+                '<div style="margin-top:14px;font-size:10px;font-weight:700;text-transform:uppercase;'
+                'letter-spacing:.8px;color:var(--muted)">Sample Comments</div>',
+                unsafe_allow_html=True,
+            )
+            for s in samples:
+                display = _redact(s) if redact_pii else s
+                short   = display[:220] + "…" if len(display) > 220 else display
+                # bold-highlight matched keywords
+                if cat_kw_set:
+                    _hl_pat = re.compile(
+                        "|".join(re.escape(k) for k in sorted(cat_kw_set, key=len, reverse=True)),
+                        re.IGNORECASE,
+                    )
+                    highlighted = _hl_pat.sub(
+                        lambda m: f'<strong style="color:#A04040">{_html.escape(m.group())}</strong>',
+                        _html.escape(short),
+                    )
+                else:
+                    highlighted = _html.escape(short)
+                st.markdown(
+                    f'<div style="background:var(--warm-l);border-radius:6px;padding:9px 12px;'
+                    f'margin-top:7px;font-size:12px;color:var(--text2);line-height:1.6">'
+                    f'{highlighted}</div>',
+                    unsafe_allow_html=True,
+                )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE 4 — AUDIT TRAIL
 # ─────────────────────────────────────────────────────────────────────────────
 elif page == "Audit Trail":
-    shdr("Audit Trail — Row-Level Traceability", "🔎")
 
     if "result" not in st.session_state:
         st.info("Run analysis first."); st.stop()
 
-    out      = st.session_state.result
-    id_col   = st.session_state.get("_id_col", id_col)
-    text_col = st.session_state.get("_text_col", text_col)
+    out                        = st.session_state.result
+    id_col, text_col, _domain = _page_state(id_col, text_col, domain)
+    total    = len(out)
 
-    a1, a2, a3 = st.columns(3)
-    with a1:
-        f_sent = st.selectbox("Sentiment",   ["All"] + SENTIMENT_ORDER, key="at_sent")
-    with a2:
-        f_src  = st.selectbox("Source",      ["All", "Validation", "Model"],              key="at_src")
-    with a3:
-        f_conf = st.selectbox("Confidence",  ["All", "High (>0.7)", "Medium (0.3–0.7)", "Low (<0.3)"], key="at_conf")
+    # ── Triage cards ──────────────────────────────────────────────────────────
+    triage_defs = [
+        ("Validation", "Validation Overrides", "#3D7A5F",
+         lambda d: d[d["validation_source"] == "Validation"]),
+        ("Rule",       "Rule-fired",            "#2D5F6E",
+         lambda d: d[d["_rule_fired"].str.startswith("rule:", na=False)] if "_rule_fired" in d.columns else d.iloc[0:0]),
+        ("VADER",      "VADER",                 "#6B8A99",
+         lambda d: d[d["_rule_fired"] == "vader"] if "_rule_fired" in d.columns else d.iloc[0:0]),
+        ("BERT",       "BERT Corrections",      "#D4B94E",
+         lambda d: d[d["_rule_fired"].str.startswith("bert:", na=False)] if "_rule_fired" in d.columns else d.iloc[0:0]),
+        ("LowConf",    "Low Confidence",        "#C87A40",
+         lambda d: d[(d["confidence"] < 0.3) & (d["validation_source"] == "Model")]),
+        ("Blank",      "Blank / Unscored",      "#A8BCC8",
+         lambda d: d[d["_rule_fired"].isin(["blank", "non_english"])] if "_rule_fired" in d.columns else d.iloc[0:0]),
+    ]
 
-    ad = out.copy()
-    if f_sent != "All": ad = ad[ad["consumer_sentiment"] == f_sent]
-    if f_src  != "All": ad = ad[ad["validation_source"]  == f_src]
-    if "High"   in f_conf: ad = ad[ad["confidence"] > 0.7]
-    elif "Medium" in f_conf: ad = ad[(ad["confidence"] >= 0.3) & (ad["confidence"] <= 0.7)]
-    elif "Low"    in f_conf: ad = ad[ad["confidence"] < 0.3]
+    # Compute counts once
+    triage_counts = {}
+    for k, lbl, col, fn in triage_defs:
+        try:
+            triage_counts[k] = len(fn(out))
+        except Exception:
+            triage_counts[k] = 0
 
-    st.markdown(f'<span class="badge b-info">{len(ad):,} rows match filters</span>', unsafe_allow_html=True)
+    active_triage = [(k, lbl, col, fn) for k, lbl, col, fn in triage_defs if triage_counts[k] > 0]
 
-    show = [c for c in [
-        id_col, text_col,
-        "CustomerOnly", "Cleaned_Comments", "Translated_Text", "Text_For_Analysis",
-        "consumer_sentiment", "consumer_score",
-        "confidence", "validation_source", "Negative_Keywords"
-    ] if c in ad.columns]
-    st.dataframe(ad[show].reset_index(drop=True), use_container_width=True, height=480)
+    triage_cols = st.columns(len(active_triage))
+    for i, (k, lbl, col, fn) in enumerate(active_triage):
+        cnt = triage_counts[k]
+        with triage_cols[i]:
+            st.markdown(mc_anim(lbl, f"{cnt:,}", col, delay=i * 0.05), unsafe_allow_html=True)
+            st.caption(f"{round(cnt / total * 100, 1)}%")
 
-    # Export filtered
-    _audit_domain = st.session_state.get("_domain", "sentiment")
-    st.download_button(
-        "⬇️ Export filtered audit CSV",
-        data=ad.to_csv(index=False).encode(),
-        file_name=f"{_audit_domain}_audit_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv", use_container_width=True, key="at_dl",
+    st.divider()
+
+    # ── Filters ───────────────────────────────────────────────────────────────
+    _bucket_opts = [lbl for _, lbl, _, _ in active_triage]
+    f_bucket = st.pills("Triage bucket", _bucket_opts, selection_mode="single", default=None, key="at_bucket")
+    fc2, fc3 = st.columns(2)
+    with fc2:
+        f_sent = st.pills("Sentiment", SENTIMENT_ORDER, selection_mode="single", default=None, key="at_sent")
+    with fc3:
+        f_conf = st.pills("Confidence", ["High (>0.7)", "Medium (0.3–0.7)", "Low (<0.3)"], selection_mode="single", default=None, key="at_conf")
+
+    ad = out
+    if f_bucket:
+        _, _, _, bucket_fn = next((t for t in active_triage if t[1] == f_bucket), (None, None, None, None))
+        if bucket_fn:
+            try:
+                ad = bucket_fn(ad)
+            except Exception:
+                pass
+    if f_sent:   ad = ad[ad["consumer_sentiment"] == f_sent]
+    if f_conf:
+        if "High"   in f_conf: ad = ad[ad["confidence"] > 0.7]
+        elif "Medium" in f_conf: ad = ad[(ad["confidence"] >= 0.3) & (ad["confidence"] <= 0.7)]
+        elif "Low"    in f_conf: ad = ad[ad["confidence"] < 0.3]
+
+    # ── Selectable compact table ───────────────────────────────────────────────
+    show_cols = [c for c in [id_col, "consumer_sentiment", "consumer_score", "confidence", "_rule_fired"] if c in ad.columns]
+    at_df     = ad[show_cols].reset_index(drop=True)
+    if "consumer_sentiment" in at_df.columns:
+        at_df = at_df.assign(consumer_sentiment=at_df["consumer_sentiment"].map(_SENT_PILL).fillna(at_df["consumer_sentiment"]))
+
+    st.caption(f"{len(at_df):,} records — click a row to see lineage")
+    at_sel = st.dataframe(
+        at_df,
+        on_select="rerun",
+        selection_mode="single-row",
+        width='stretch',
+        height=360,
+        key="at_tbl_sel",
+        column_config={
+            "consumer_sentiment": st.column_config.TextColumn("Sentiment", width="medium"),
+            "consumer_score":     st.column_config.NumberColumn("Score", format="%.3f", width="small"),
+            "confidence":         st.column_config.NumberColumn("Conf", format="%.2f", width="small"),
+            "_rule_fired":        st.column_config.TextColumn("Method", width="medium"),
+        },
     )
+
+    # ── Record lineage panel ───────────────────────────────────────────────────
+    selected = at_sel.selection.rows if hasattr(at_sel, "selection") else []
+    if selected:
+        orig_idx = ad.index[selected[0]]
+        row      = out.loc[orig_idx]
+
+        st.divider()
+        st.markdown("**Record lineage**")
+
+        steps = []
+        raw_text = row.get(text_col, "")
+        if isinstance(raw_text, str) and raw_text.strip():
+            display = _redact(raw_text[:300]) if redact_pii else raw_text[:300]
+            steps.append(("Source text", display + ("…" if len(str(raw_text)) > 300 else ""), "#6B8A99"))
+
+        for ecol in ["CustomerOnly", "ConsumerOnly", "Text_For_Analysis"]:
+            if ecol in row.index and isinstance(row[ecol], str) and row[ecol].strip() and row[ecol] != raw_text:
+                display = _redact(row[ecol][:300]) if redact_pii else row[ecol][:300]
+                steps.append((ecol.replace("_", " "), display + ("…" if len(row[ecol]) > 300 else ""), "#3A7A8C"))
+                break
+
+        steps.append(("Classification method", str(row.get("_rule_fired", "—")), "#D4B94E"))
+
+        raw_vader = row.get("_raw_vader", None)
+        if raw_vader is not None and not pd.isna(raw_vader):
+            steps.append(("VADER raw score", f"{float(raw_vader):+.4f}", "#6B8A99"))
+
+        score = row.get("consumer_score", 0) or 0
+        conf  = row.get("confidence", 0) or 0
+        sent  = str(row.get("consumer_sentiment", "—"))
+        steps.append(("Final score", f"{float(score):+.4f}", "#2D5F6E"))
+        steps.append(("Sentiment · Confidence", f"{sent} · {float(conf):.2f}",
+                       SENTIMENT_COLORS.get(sent, "#6B8A99")))
+
+        if row.get("validation_source") == "Validation":
+            steps.append(("Override", "Validation file — model output replaced", "#3D7A5F"))
+
+        html_parts = ['<div style="display:flex;flex-direction:column;gap:0">']
+        for i, (label, value, color) in enumerate(steps):
+            connector = (
+                f'<div style="width:2px;height:10px;background:{color};opacity:.35;margin-left:10px"></div>'
+                if i < len(steps) - 1 else ""
+            )
+            html_parts.append(
+                f'<div style="display:flex;align-items:flex-start;gap:10px">'
+                f'<div style="width:20px;height:20px;border-radius:50%;background:{color};flex-shrink:0;'
+                f'display:flex;align-items:center;justify-content:center;font-size:9px;color:#fff;font-weight:700">'
+                f'{i+1}</div>'
+                f'<div style="flex:1;padding-bottom:4px">'
+                f'<div class="detail-label">{_html.escape(label)}</div>'
+                f'<div class="detail-value" style="white-space:pre-wrap;word-break:break-word">'
+                f'{_html.escape(value)}</div></div></div>{connector}'
+            )
+        html_parts.append('</div>')
+        st.markdown("".join(html_parts), unsafe_allow_html=True)
+
+        kw = row.get("Negative_Keywords", "")
+        if isinstance(kw, str) and kw.strip():
+            st.markdown(
+                f'<div style="margin-top:10px;padding:8px 12px;background:var(--warm-l);'
+                f'border-radius:6px;font-size:12px">'
+                f'<span class="detail-label">Negative keywords: </span>'
+                f'<span style="color:var(--text2)">{_html.escape(kw)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+    st.divider()
+    _csv_download(ad, "Export filtered CSV", _domain, key="at_dl", suffix="audit")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FOOTER
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown(
-    '<div style="text-align:center;color:#6B8A99;font-size:11px;padding:20px 0 4px">'
-    'SentimentHub &nbsp;|  Multi-Domain · VADER Adaptive · Hybrid Model · Validation Override'
-    '</div>',
-    unsafe_allow_html=True
-)
+st.markdown("""
+<div style="text-align:center;padding:28px 0 12px;color:var(--muted);font-size:11px">
+  Sentix · Multi-Domain Sentiment Intelligence · Streamlit
+</div>
+""", unsafe_allow_html=True)

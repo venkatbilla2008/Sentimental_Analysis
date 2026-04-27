@@ -3,6 +3,12 @@ Sentix — Multi-Domain Sentiment Analysis
 Run: streamlit run app.py
 """
 
+import os
+import sys
+
+# Ensure the app's own directory is on the path so `domains/` is always found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import hashlib
 import html as _html
 import io

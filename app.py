@@ -1,5 +1,5 @@
 """
-Sentix — Multi-Domain Sentiment Analysis
+SentiMiner — Multi-Domain Sentiment Analysis
 Run: streamlit run app.py
 """
 
@@ -67,7 +67,7 @@ DOMAIN_CONFIG = {
 # PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Sentix",
+    page_title="SentiMiner",
     layout="wide",
     page_icon="🔍",
     initial_sidebar_state="expanded",
@@ -509,7 +509,7 @@ header[data-testid="stHeader"]{display:none!important}
 
   <div style="position:relative;z-index:2;width:100%;max-width:900px">
     <div class="lp-badge"><span class="lp-badge-dot"></span>MULTI-DOMAIN SENTIMENT INTELLIGENCE</div>
-    <h1 class="lp-title">Sentix</h1>
+    <h1 class="lp-title">SentiMiner</h1>
     <p class="lp-sub">See what your customers truly feel — across every channel, every conversation.</p>
     <div class="lp-tagline-wrap">
       <span class="lp-tagline" id="lp-tag">From transcript to insight in seconds.</span>
@@ -521,7 +521,7 @@ header[data-testid="stHeader"]{display:none!important}
           <div class="lp-dot" style="background:#FF5F57"></div>
           <div class="lp-dot" style="background:#FEBC2E"></div>
           <div class="lp-dot" style="background:#28C840"></div>
-          <span style="margin-left:12px;font-size:12px;color:#6B8A99;font-family:'DM Sans',sans-serif">Sentix — Sentiment Analysis</span>
+          <span style="margin-left:12px;font-size:12px;color:#6B8A99;font-family:'DM Sans',sans-serif">SentiMiner — Sentiment Analysis</span>
         </div>
         <div class="lp-winbody">
           <div class="lp-kpi" style="border-top-color:#3D7A5F">
@@ -675,7 +675,7 @@ header[data-testid="stHeader"]{display:none!important}
 
 <!-- FOOTER -->
 <div class="lp-footer">
-  <div class="lp-footer-name">Sentix</div>
+  <div class="lp-footer-name">SentiMiner</div>
   <div class="lp-footer-sub">Multi-Domain Sentiment Intelligence · VADER Adaptive · Built with Streamlit</div>
 </div>
 
@@ -866,7 +866,7 @@ with st.sidebar:
     st.markdown(
         f'<div style="display:flex;align-items:center;gap:10px;padding:10px 0 14px">'
         f'{_logo_icon(34, 1.8)}'
-        f'<div><span style="font-size:15px;font-weight:700;color:#1E2D33">Sentix</span><br>'
+        f'<div><span style="font-size:15px;font-weight:700;color:#1E2D33">SentiMiner</span><br>'
         f'<span style="font-size:11px;color:#7A95A2">Multi-Domain · VADER Adaptive</span></div>'
         f'</div>',
         unsafe_allow_html=True,
@@ -957,7 +957,7 @@ if page == "Home":
 st.markdown(
     f'<div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">'
     f'{_logo_icon(40, 1.6)}'
-    f'<div><h1 style="margin:0;font-size:22px;line-height:1.2;color:#1E2D33">Sentix</h1>'
+    f'<div><h1 style="margin:0;font-size:22px;line-height:1.2;color:#1E2D33">SentiMiner</h1>'
     f'<p style="margin:0;color:#7A95A2;font-size:12px">Multi-Domain Sentiment Intelligence · VADER Adaptive</p></div>'
     f'</div>',
     unsafe_allow_html=True,
@@ -1042,7 +1042,7 @@ if page == "Upload & Analyse":
 | **Domain** | The business context (PPT, Hilton, Netflix, Spotify, GoDaddy) — determines which extraction and classification rules apply. |
 | **Validation Override** | An Excel file with pre-labelled sentiments. These labels take highest priority and override all model predictions. Must contain an ID column and an *Actual Sentiment* column. |
 | **Rule Confidence Threshold** | Minimum confidence required for a rule-based classification to be accepted without falling back to VADER. Default 0.70. |
-| **Auto-detect** | Sentix reads a sample of the uploaded file and infers the domain and column mapping automatically. |
+| **Auto-detect** | SentiMiner reads a sample of the uploaded file and infers the domain and column mapping automatically. |
 """)
 
 
@@ -1649,6 +1649,6 @@ elif page == "Audit Trail":
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div style="text-align:center;padding:28px 0 12px;color:var(--muted);font-size:11px">
-  Sentix · Multi-Domain Sentiment Intelligence · Streamlit
+  SentiMiner · Multi-Domain Sentiment Intelligence · Streamlit
 </div>
 """, unsafe_allow_html=True)
